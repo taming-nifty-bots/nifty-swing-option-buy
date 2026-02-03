@@ -99,6 +99,33 @@ def get_straddle_chart(conn, strike=19950, CE_option_symbol=None, PE_option_symb
     straddle = ta.convert_to_pnf(brick_size=0.5, df=straddle)
     return straddle, CE_option_symbol, PE_option_symbol
 
+
+@retry(tries=5, delay=5, backoff=2)
+def fetch_oi(conn, trading_symbol: str):
+    try:
+        quote = edge.fetch_historical_data(conn, 'NFO', trading_symbol, (datetime.now() - timedelta(days=7)), datetime.today(), 'min')
+        return quote['oi'].iloc[-1]
+    except Exception as e:
+        print(f"Exception encountered: {e}. Retrying...")
+
+def pcr(conn,atm=25700,multiple=100):
+    atm_strike = atm
+    call_oi = 0
+    put_oi = 0
+    for i in range(5):
+        symbol, expiry = get_option_symbol(strike=atm, option_type="CE")
+        call_oi += fetch_oi(conn, symbol)
+        atm += multiple
+
+    for i in range(5):
+        symbol, expiry = get_option_symbol(strike=atm_strike, option_type="PE")
+        put_oi += fetch_oi(conn, symbol)
+        atm_strike -= multiple
+    pcr_value = put_oi / call_oi if call_oi != 0 else float('inf')
+    return round(pcr_value, 2)
+
+
+
 def main():
     print("Option Buying Signal is running...")
     util.notify(message=f"{instrument_name} Option Buying Signal is Alive!", slack_client=slack_client, slack_channel=slack_channel)
@@ -125,10 +152,12 @@ def main():
             elif current_time > parser.parse("09:29:00").time():
                 if initialization_needed:
                     Nifty_ltp = edge.fetch_ltp(conn, "NSE", "Nifty 50")
+
                     delta = Nifty_ltp * 0.01 #can be used to calculate AT_PREV and ATM_NEXT strikes
                     atm_next_strike = util.round_to_nearest(Nifty_ltp + delta, base=50)
                     atm_prev_strike = util.round_to_nearest(Nifty_ltp - delta, base=50)
 
+                    pcr_value = pcr(conn, atm=util.round_to_nearest(Nifty_ltp, base=50), multiple=50)
                     atm_next_HPFT_high = None
                     atm_prev_HPFT_high = None
 
@@ -198,16 +227,16 @@ def main():
 
 
                 if supertrend_collection.count_documents({"_id": "atm_next_straddle"}) == 0:
-                    st = {"_id": "atm_next_straddle", "datetime": atm_next_straddle.iloc[-1]['datetime'], "straddle_close": atm_next_straddle.iloc[-1]['close'], "strike": atm_next_strike, "HPFT":atm_next_HPFT, "HPFT_high":atm_next_HPFT_high, "BTFT":atm_next_BTFT, "CE_option_symbol": atm_next_CE_option_symbol, "PE_option_symbol": atm_next_PE_option_symbol, "HP_high": atm_next_HP_high}
+                    st = {"_id": "atm_next_straddle", "datetime": atm_next_straddle.iloc[-1]['datetime'], "straddle_close": atm_next_straddle.iloc[-1]['close'], "strike": atm_next_strike, "HPFT":atm_next_HPFT, "HPFT_high":atm_next_HPFT_high, "BTFT":atm_next_BTFT, "CE_option_symbol": atm_next_CE_option_symbol, "PE_option_symbol": atm_next_PE_option_symbol, "HP_high": atm_next_HP_high, "pcr": pcr_value}
                     supertrend_collection.insert_one(st)
                 else:
-                    supertrend_collection.update_one({"_id": "atm_next_straddle"}, {"$set": {"datetime": atm_next_straddle.iloc[-1]['datetime'], "straddle_close": atm_next_straddle.iloc[-1]['close'], "strike": atm_next_strike, "HPFT":atm_next_HPFT, "HPFT_high":atm_next_HPFT_high, "BTFT":atm_next_BTFT, "CE_option_symbol": atm_next_CE_option_symbol, "PE_option_symbol": atm_next_PE_option_symbol, "HP_high": atm_next_HP_high}})
+                    supertrend_collection.update_one({"_id": "atm_next_straddle"}, {"$set": {"datetime": atm_next_straddle.iloc[-1]['datetime'], "straddle_close": atm_next_straddle.iloc[-1]['close'], "strike": atm_next_strike, "HPFT":atm_next_HPFT, "HPFT_high":atm_next_HPFT_high, "BTFT":atm_next_BTFT, "CE_option_symbol": atm_next_CE_option_symbol, "PE_option_symbol": atm_next_PE_option_symbol, "HP_high": atm_next_HP_high, "pcr": pcr_value}})
                 
                 if supertrend_collection.count_documents({"_id": "atm_prev_straddle"}) == 0:
-                    st = {"_id": "atm_prev_straddle", "datetime": atm_prev_straddle.iloc[-1]['datetime'], "straddle_close": atm_prev_straddle.iloc[-1]['close'], "strike": atm_prev_strike, "HPFT":atm_prev_HPFT, "HPFT_high":atm_prev_HPFT_high, "BTFT":atm_prev_BTFT, "CE_option_symbol": atm_prev_CE_option_symbol, "PE_option_symbol": atm_prev_PE_option_symbol, "HP_high": atm_prev_HP_high}
+                    st = {"_id": "atm_prev_straddle", "datetime": atm_prev_straddle.iloc[-1]['datetime'], "straddle_close": atm_prev_straddle.iloc[-1]['close'], "strike": atm_prev_strike, "HPFT":atm_prev_HPFT, "HPFT_high":atm_prev_HPFT_high, "BTFT":atm_prev_BTFT, "CE_option_symbol": atm_prev_CE_option_symbol, "PE_option_symbol": atm_prev_PE_option_symbol, "HP_high": atm_prev_HP_high, "pcr": pcr_value}
                     supertrend_collection.insert_one(st)
                 else:
-                    supertrend_collection.update_one({"_id": "atm_prev_straddle"}, {"$set": {"datetime": atm_prev_straddle.iloc[-1]['datetime'], "straddle_close": atm_prev_straddle.iloc[-1]['close'], "strike": atm_prev_strike, "HPFT":atm_prev_HPFT, "HPFT_high":atm_prev_HPFT_high, "BTFT":atm_prev_BTFT, "CE_option_symbol": atm_prev_CE_option_symbol, "PE_option_symbol": atm_prev_PE_option_symbol, "HP_high": atm_prev_HP_high}})
+                    supertrend_collection.update_one({"_id": "atm_prev_straddle"}, {"$set": {"datetime": atm_prev_straddle.iloc[-1]['datetime'], "straddle_close": atm_prev_straddle.iloc[-1]['close'], "strike": atm_prev_strike, "HPFT":atm_prev_HPFT, "HPFT_high":atm_prev_HPFT_high, "BTFT":atm_prev_BTFT, "CE_option_symbol": atm_prev_CE_option_symbol, "PE_option_symbol": atm_prev_PE_option_symbol, "HP_high": atm_prev_HP_high, "pcr": pcr_value}})
 
                 
         print("repeating loop for Supertrend")

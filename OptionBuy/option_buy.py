@@ -204,7 +204,7 @@ def get_option_symbol(strike=19950, option_type = "PE" ):
     print(f"Symbol: {df['TRADINGSYM'].values[0]} , Expiry: {df['EXPIRY'].values[0]}")
     return df['TRADINGSYM'].values[0], df['EXPIRY'].values[0]
 
-def buy_put(strike=19950):
+def buy_put(strike=19950, pcr=None):
     option_type = "PE"
     util.notify(f"Buy Strike: {strike}",slack_client=slack_client, slack_channel=slack_channel)
     buy_strike_symbol, expiry = get_option_symbol(strike, option_type)
@@ -220,9 +220,9 @@ def buy_put(strike=19950):
         raise Exception("Error in placing buy order - " + str(buy_order['message']))
     long_option_cost = buy_order['average_traded_price']
     util.notify("PUT Option Long successfull!",slack_client=slack_client, slack_channel=slack_channel)
-    record_details_in_mongo(buy_strike_symbol, "Bearish", expiry, long_option_cost)
+    record_details_in_mongo(buy_strike_symbol, "Bearish", expiry, long_option_cost, pcr)
 
-def buy_call(strike=19950):
+def buy_call(strike=19950, pcr=None):
     option_type = "CE"
     util.notify(f"Buy Strike: {strike}",slack_client=slack_client, slack_channel=slack_channel)
     buy_strike_symbol, expiry = get_option_symbol(strike, option_type)
@@ -238,9 +238,9 @@ def buy_call(strike=19950):
         raise Exception("Error in placing buy order - " + str(buy_order['message']))
     long_option_cost = buy_order['average_traded_price']
     util.notify("CALL Option Long successfull!",slack_client=slack_client, slack_channel=slack_channel)
-    record_details_in_mongo(buy_strike_symbol, "Bullish", expiry, long_option_cost)
+    record_details_in_mongo(buy_strike_symbol, "Bullish", expiry, long_option_cost, pcr)
 
-def record_details_in_mongo(buy_strike_symbol, trend, expiry, long_option_cost):
+def record_details_in_mongo(buy_strike_symbol, trend, expiry, long_option_cost, pcr=None):
     conn = edge.login_to_integrate()
     vix = edge.fetch_ltp(conn, 'NSE', 'India VIX')
     if instrument_name == "NIFTY":
@@ -250,6 +250,7 @@ def record_details_in_mongo(buy_strike_symbol, trend, expiry, long_option_cost):
     strategy = {
     'instrument_name': instrument_name,
     'India Vix': vix,
+    'pcr': pcr,
     'quantity': int(quantity),
     'lot_size': lot_size,
     'long_exit_price': 0,
@@ -381,9 +382,9 @@ def main():
                     atm_prev_straddle = supertrend_collection.find_one({"_id": "atm_prev_straddle"})
 
                     if atm_next_straddle['HPFT'] == True and current_time > datetime.time(hour=9, minute=31):
-                        buy_call(strike=atm_next_straddle['strike'])
+                        buy_call(strike=atm_next_straddle['strike'], pcr=atm_next_straddle['pcr'])
                     elif atm_prev_straddle['HPFT'] == True and current_time > datetime.time(hour=9, minute=31):
-                        buy_put(strike=atm_prev_straddle['strike'])
+                        buy_put(strike=atm_prev_straddle['strike'], pcr=atm_prev_straddle['pcr'])
                     else:
                         print("Waiting for the entry signal...")
         except Exception as e:
