@@ -26,7 +26,7 @@ load_dotenv(dotenv_file)
 slack_channel = "niftyswing"
 CONNECTION_STRING = os.environ.get('CONNECTION_STRING')  # Mongo Connection
 user_name = os.environ.get('user_name')
-trade_start_time = parser.parse("9:16:00").time()
+trade_start_time = parser.parse("09:16:00").time()
 trade_end_time = parser.parse("15:28:00").time()
 slack_client = WebClient(token=os.environ.get('slack_token'))
 quantity = os.environ.get('quantity')
@@ -198,7 +198,7 @@ def get_option_symbol(strike=19950, option_type = "PE" ):
     # Get the current date
     current_date = datetime.datetime.now()
 
-    df= df[(df['EXPIRY'] > (current_date + timedelta(days=5)))]
+    df= df[(df['EXPIRY'] > (current_date + timedelta(days=3)))]
     df = df.head(1)
     print("Getting options Symbol...")
     print(f"Symbol: {df['TRADINGSYM'].values[0]} , Expiry: {df['EXPIRY'].values[0]}")
@@ -371,7 +371,7 @@ def main():
                             try:
                                 entry_date_obj = parser.parse(entry_date).date()
                                 days_active = (datetime.datetime.now().date() - entry_date_obj).days
-                                if days_active >= 2:
+                                if days_active >= 2 and current_time >= datetime.time(hour=14, minute=30):
                                     util.notify("Time based Stop Loss Hit (2 days active)", slack_client=slack_client, slack_channel=slack_channel)
                                     close_active_positions("Time based Stop Loss (2 days)")
                                     break
@@ -381,9 +381,9 @@ def main():
                     atm_next_straddle = supertrend_collection.find_one({"_id": "atm_next_straddle"})
                     atm_prev_straddle = supertrend_collection.find_one({"_id": "atm_prev_straddle"})
 
-                    if atm_next_straddle['HPFT'] == True and current_time > datetime.time(hour=9, minute=31):
+                    if (atm_next_straddle['HPFT'] == True or atm_next_straddle['AFT'] == True) and current_time > datetime.time(hour=9, minute=31):
                         buy_call(strike=atm_next_straddle['strike'], pcr=atm_next_straddle['pcr'])
-                    elif atm_prev_straddle['HPFT'] == True and current_time > datetime.time(hour=9, minute=31):
+                    elif (atm_prev_straddle['HPFT'] == True or atm_prev_straddle['AFT'] == True) and current_time > datetime.time(hour=9, minute=31):
                         buy_put(strike=atm_prev_straddle['strike'], pcr=atm_prev_straddle['pcr'])
                     else:
                         print("Waiting for the entry signal...")
