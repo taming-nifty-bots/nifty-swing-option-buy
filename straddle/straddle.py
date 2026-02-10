@@ -190,6 +190,8 @@ def main():
                     # Check for Anchor Coloumn at -5
                     elif atm_prev_straddle.iloc[-5]['count'] >=25 and atm_prev_straddle.iloc[-4:]['high'].max() <= atm_prev_straddle.iloc[-5]['high']:
                         atm_prev_AFT = True
+                else:
+                    atm_prev_AFT = False
 
 
                 if supertrend_collection.count_documents({"_id": "atm_next_straddle"}) == 0:
