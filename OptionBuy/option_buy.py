@@ -368,6 +368,11 @@ def main():
                             close_active_positions("Target HIT")
                             break
 
+                        if datetime.datetime.now().strftime('%A') == "Friday" and current_time >= datetime.time(hour=15, minute=15):
+                            util.notify("Friday Exit Time Reached", slack_client=slack_client, slack_channel=slack_channel)
+                            close_active_positions("Exit Before Weekend")
+                            break
+
                         print(str(datetime.datetime.now().date()))
                         # Time-based stop loss: exit if position active for 2 days
                         entry_date = strategy.get('entry_date')
