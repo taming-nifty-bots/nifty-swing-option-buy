@@ -243,39 +243,60 @@ def buy_call(strike=19950, pcr=None):
 def record_details_in_mongo(buy_strike_symbol, trend, expiry, long_option_cost, pcr=None):
     conn = edge.login_to_integrate()
     vix = edge.fetch_ltp(conn, 'NSE', 'India VIX')
+    VIX_ref = 15  # Reference VIX, can be tuned or made configurable
+    # RR: 1:1 at high VIX (e.g. VIX=30), 1:4 at low VIX (e.g. VIX=10)
+    min_rr = 1.0
+    max_rr = 4.0
+    vix_min = 10.0
+    vix_max = 30.0
+    # Linear interpolation for RR
+    rr = max(min_rr, min(max_rr, max_rr - (vix - vix_min) * (max_rr - min_rr) / (vix_max - vix_min)))
+
+    # VIX-based stop loss calculation
+    base_stop_loss = -1250 * total_lots
+    vix_multiplier = max(0.5, min(vix / VIX_ref, 2.0))  # Clamp for stability
+    stop_loss = max(base_stop_loss * vix_multiplier, round(-0.5 * long_option_cost * int(quantity), 2))
+    trailing_stop_loss = stop_loss
+    # Target is stop_loss * RR (positive value)
+    raw_target = abs(stop_loss) * rr
+    # Cap target to cost-based limit
+    cost_based_target = round(2 * long_option_cost * int(quantity), 2)
+    target = min(raw_target, cost_based_target)
+
     if instrument_name == "NIFTY":
         trading_symbol = "Nifty 50"
     elif instrument_name == "BANKNIFTY":
         trading_symbol = "Nifty Bank"
     strategy = {
-    'instrument_name': instrument_name,
-    'India Vix': vix,
-    'pcr': pcr,
-    'quantity': int(quantity),
-    'lot_size': lot_size,
-    'long_exit_price': 0,
-    'strategy_state': 'active',
-    'entry_date': str(datetime.datetime.now().date()),
-    'exit_date': '',
-    'entry_day_of_week': datetime.datetime.now().strftime('%A'),
-    'exit_day_of_week': '',
-    'trend' : trend,
-    'long_option_symbol' : buy_strike_symbol,
-    'long_option_cost' : long_option_cost,
-    'stop_loss' : max((-1250 * total_lots), round(-0.5 * long_option_cost * int(quantity), 2)),
-    'trailing_stop_loss' : max((-1250 * total_lots), round(-0.5 * long_option_cost * int(quantity), 2)),
-    'target' : min((5000 * total_lots), round(2 * long_option_cost * int(quantity), 2)),
-    'total_investment' : round(long_option_cost * int(quantity), 2),
-    'entry_time' : datetime.datetime.now().strftime('%H:%M'),
-    'exit_time' : '',
-    'instrument_close' : edge.fetch_ltp(conn, 'NSE', trading_symbol),
-    'expiry' : str(expiry),
-    'running_pnl' : 0,
-    'exit_reason': '',
-    'pnl': '',
-    'net_pnl': '',
-    'max_pnl_reached': 0,
-    'min_pnl_reached': 0
+        'instrument_name': instrument_name,
+        'India Vix': vix,
+        'pcr': pcr,
+        'quantity': int(quantity),
+        'lot_size': lot_size,
+        'long_exit_price': 0,
+        'strategy_state': 'active',
+        'entry_date': str(datetime.datetime.now().date()),
+        'exit_date': '',
+        'entry_day_of_week': datetime.datetime.now().strftime('%A'),
+        'exit_day_of_week': '',
+        'trend': trend,
+        'long_option_symbol': buy_strike_symbol,
+        'long_option_cost': long_option_cost,
+        'stop_loss': stop_loss,
+        'trailing_stop_loss': trailing_stop_loss,
+        'target': target,
+        'rr': rr,
+        'total_investment': round(long_option_cost * int(quantity), 2),
+        'entry_time': datetime.datetime.now().strftime('%H:%M'),
+        'exit_time': '',
+        'instrument_close': edge.fetch_ltp(conn, 'NSE', trading_symbol),
+        'expiry': str(expiry),
+        'running_pnl': 0,
+        'exit_reason': '',
+        'pnl': '',
+        'net_pnl': '',
+        'max_pnl_reached': 0,
+        'min_pnl_reached': 0
     }
     strategies.insert_one(strategy)
 
