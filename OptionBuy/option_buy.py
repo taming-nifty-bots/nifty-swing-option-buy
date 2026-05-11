@@ -246,7 +246,7 @@ def record_details_in_mongo(buy_strike_symbol, trend, expiry, long_option_cost, 
     VIX_ref = 15  # Reference VIX, can be tuned or made configurable
     # RR: 1:1 at high VIX (e.g. VIX=30), 1:4 at low VIX (e.g. VIX=10)
     min_rr = 1.0
-    max_rr = 4.0
+    max_rr = 3.0
     vix_min = 10.0
     vix_max = 30.0
     # Linear interpolation for RR
@@ -282,10 +282,10 @@ def record_details_in_mongo(buy_strike_symbol, trend, expiry, long_option_cost, 
         'trend': trend,
         'long_option_symbol': buy_strike_symbol,
         'long_option_cost': long_option_cost,
-        'stop_loss': stop_loss,
-        'trailing_stop_loss': trailing_stop_loss,
-        'target': target,
-        'rr': rr,
+        'stop_loss': round(stop_loss, 2),
+        'trailing_stop_loss': round(trailing_stop_loss, 2),
+        'target': round(target, 2),
+        'rr': round(rr, 2),
         'total_investment': round(long_option_cost * int(quantity), 2),
         'entry_time': datetime.datetime.now().strftime('%H:%M'),
         'exit_time': '',
@@ -373,8 +373,18 @@ def main():
                         pnl = get_pnl(strategy, start)
                         if strategy['max_pnl_reached'] < pnl:                         
                             strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': pnl}})
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'trailing_stop_loss': strategy['stop_loss'] + pnl}})
-                            util.notify(f"New Max PnL reached: {pnl}, Updated Trailing SL: {strategy['stop_loss'] + pnl}",slack_client=slack_client, slack_channel=slack_channel)
+                            
+                            # Unlock trailing only after +1R profit
+                            initial_risk = abs(strategy['stop_loss'])  # e.g., 1514
+                            if pnl >= initial_risk:
+                                # Trail at 0.5:1 above 1R (move stop 0.5 for every 1 rupee above 1R)
+                                profit_above_1R = pnl - initial_risk
+                                new_trail = strategy['stop_loss'] + initial_risk + (profit_above_1R * 0.5)
+                                strategies.update_one({'_id': strategy['_id']}, {'$set': {'trailing_stop_loss': round(new_trail, 2)}})
+                                util.notify(f"Profit 1R unlocked! New Trailing SL: {round(new_trail, 2)}", slack_client=slack_client, slack_channel=slack_channel)
+                            else:
+                                # Still below 1R, keep initial stop loss
+                                util.notify(f"New Max PnL: {pnl}, awaiting +1R unlock for trailing", slack_client=slack_client, slack_channel=slack_channel)
                         
                         if strategy['min_pnl_reached'] > pnl:
                             strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': pnl}})
