@@ -42,8 +42,8 @@ def notify(client, message):
         print("Slack notification failed: " + util.exception_detail(error), flush=True)
 
 
-def signal_id(user, day):
-    return f"NIFTY_premium_renko_{user}_{day}"
+def signal_id(user):
+    return f"NIFTY_premium_renko_{user}"
 
 
 def trade_id(user, day):
@@ -66,34 +66,34 @@ def validate_quantity(quantity, lot_size):
 
 
 def fresh_signal(doc, user, now):
-    day = str(now.date())
-    if (doc is None or doc.get("_id") != signal_id(user, day)
-            or doc.get("strategy_version") != VERSION or doc.get("day") != day):
+    if (doc is None or doc.get("_id") != signal_id(user)
+            or doc.get("strategy_version") != VERSION):
         raise ValueError("Missing or incompatible daily signal")
+    if pd.Timestamp(doc["updated_at"]).date() != now.date():
+        raise ValueError("Signal is not from today")
     age = (now - pd.Timestamp(doc["updated_at"]).to_pydatetime()).total_seconds()
     if not 0 <= age <= 90:
         raise ValueError("Signal publisher is stale or future-dated")
     for kind in ("CE", "PE"):
-        age = (pd.Timestamp(now).floor("min") - pd.Timestamp(doc["options"][kind]["data_asof"])).total_seconds()
+        age = (pd.Timestamp(now).floor("min") - pd.Timestamp(doc[kind + "_data_asof"])).total_seconds()
         if not 60 <= age <= 120:
             raise ValueError("Signal option candles are stale or incomplete")
     return doc
 
 
-def first_decision(options):
+def first_decision(doc):
     found = []
     for kind in ("CE", "PE"):
-        for row in options[kind]["observations"]:
-            stamp = row["brick_time"]
-            if ("09:30" <= stamp[11:16] < "15:14"
-                    and row["high40"] is not None and row["close"] > row["high40"]):
-                found.append((stamp, kind))
-                break
+        brick = pd.Timestamp(doc[kind + "_brick_time"])
+        high = doc[kind + "_last_40_high"]
+        if (brick >= pd.Timestamp(doc["updated_at"]).normalize() + pd.Timedelta(hours=9, minutes=30)
+                and high is not None and doc[kind + "_close"] > high):
+            found.append((doc[kind + "_data_asof"], kind))
     if not found:
         return None
     found.sort()
-    if len(found) == 2 and found[0][0] == found[1][0]:
-        return dict(status="skip", reason="same_minute_CE_PE_tie", signal_time=found[0][0])
+    if len(found) == 2:
+        return dict(status="skip", reason="both_latest_levels_above_high40", signal_time=found[0][0])
     return dict(status="entry", option_type=found[0][1], signal_time=found[0][0])
 
 
@@ -114,14 +114,15 @@ def exit_reason(trade, doc, now):
         return "15:15 EOD" if trade["entry_date"] == str(now.date()) else "Overdue intraday position"
     if doc is None:
         raise ValueError("Need a fresh contract signal before evaluating channel exit")
-    if (trade["security_id"] != doc["contracts"][trade["option_type"]]["security_id"]
+    kind = trade["option_type"]
+    if (trade["security_id"] != doc[kind + "_security_id"]
             or trade["expiry"] != doc["expiry"]):
         raise ValueError("Active trade and signal contracts disagree")
-    for row in doc["options"][trade["option_type"]]["observations"]:
-        if (pd.Timestamp(trade["entry_timestamp"]).floor("min") <= pd.Timestamp(row["brick_time"])
-                < pd.Timestamp(now).floor("min")
-                and row["low20"] is not None and row["close"] < row["low20"]):
-            return "20 brick low breakout"
+    if (pd.Timestamp(trade["entry_timestamp"]).floor("min") <= pd.Timestamp(doc[kind + "_brick_time"])
+            < pd.Timestamp(now).floor("min")
+            and doc[kind + "_last_20_low"] is not None
+            and doc[kind + "_close"] < doc[kind + "_last_20_low"]):
+        return "20 brick low breakout"
     return None
 
 
@@ -148,20 +149,21 @@ def paper_order(conn, orders, key, contract, quantity, side, now):
 
 
 def claim_entry(strategies, doc, user, quantity, now):
-    decision = doc.get("decision") or first_decision(doc["options"])
+    decision = first_decision(doc)
     if not entry_is_current(decision, now):
         return None
     # Include historical records: never place a second trade because its era differs.
     if strategies.find_one({"entry_date": str(now.date())}) is not None:
         return None
     kind = decision["option_type"]
-    contract = doc["contracts"][kind]
+    contract = dict(security_id=doc[kind + "_security_id"], symbol=doc[kind + "_symbol"],
+                    lot_size=doc[kind + "_lot_size"])
     qty = validate_quantity(quantity, contract["lot_size"])
     trade = dict(_id=trade_id(user, str(now.date())), strategy_version=VERSION,
                  instrument_name="NIFTY", broker="DHAN", simulated=True,
                  strategy_state="pending", entry_date=str(now.date()), entry_signal=decision["signal_time"],
                  option_type=kind, trend="Bullish" if kind == "CE" else "Bearish",
-                 strike=doc["strike"], expiry=doc["expiry"], dte=doc["dte"],
+                 strike=doc["STRIKE"], expiry=doc["expiry"], dte=doc["dte"],
                  security_id=contract["security_id"], long_option_symbol=contract["symbol"],
                  lot_size=contract["lot_size"], quantity=qty, signal_doc_id=doc["_id"],
                  entry_timestamp=str(now), entry_time=now.strftime("%H:%M:%S"))
@@ -224,7 +226,7 @@ def step(conn, strategies, orders, signals, user, quantity, now):
         reason = exit_reason(trade, None, now) if (
             now.strftime("%H:%M") >= "15:15" or trade["entry_date"] < str(now.date())) else None
         if reason is None:
-            doc = signals.find_one({"_id": signal_id(user, str(now.date()))})
+            doc = signals.find_one({"_id": signal_id(user)})
             doc = fresh_signal(doc, user, now)
             reason = exit_reason(trade, doc, now)
         if reason:
@@ -239,25 +241,15 @@ def step(conn, strategies, orders, signals, user, quantity, now):
         return None
     if strategies.find_one({"entry_date": str(now.date())}) is not None:
         return None
-    doc = signals.find_one({"_id": signal_id(user, str(now.date()))})
+    doc = signals.find_one({"_id": signal_id(user)})
     doc = fresh_signal(doc, user, now)
-    decision = doc.get("decision")
-    if decision is None:
-        decision = first_decision(doc["options"])
-        if decision is not None:
-            # Only the executor decides trades; retain its first decision across restarts.
-            signals.update_one({"_id": doc["_id"], "decision": {"$exists": False}},
-                               {"$set": {"decision": decision}})
-            doc = signals.find_one({"_id": doc["_id"]})
-            decision = doc["decision"]
+    if doc.get("skip_day"):
+        return None
+    decision = first_decision(doc)
     if decision is not None and decision["status"] == "skip":
-        return None
-    if decision is not None and not entry_is_current(decision, now):
-        if not doc.get("execution_skip"):
-            signals.update_one({"_id": doc["_id"]},
-                               {"$set": {"execution_skip": "Missed first breakout; no late entry or replacement"}})
-            return "First breakout entry window missed; no trade today"
-        return None
+        signals.update_one({"_id": doc["_id"], "updated_at": doc["updated_at"]},
+                           {"$set": {"skip_day": True}})
+        return "Both latest option levels exceed high40; skip today"
     trade = claim_entry(strategies, doc, user, quantity, now)
     if trade is not None:
         open_pending(conn, strategies, orders, trade, now)

@@ -38,8 +38,8 @@ def notify(client, message):
         print("Slack notification failed: " + util.exception_detail(error), flush=True)
 
 
-def signal_id(user, day):
-    return f"NIFTY_premium_renko_{user}_{day}"
+def signal_id(user):
+    return f"NIFTY_premium_renko_{user}"
 
 
 def locked_contracts(master, index, day):
@@ -117,41 +117,57 @@ def option_levels(candles, day, now):
         raise ValueError("Not enough history to form Renko")
     bricks["high40"] = bricks["high"].shift(1).rolling(40).max()
     bricks["low20"] = bricks["low"].shift(1).rolling(20).min()
-    snapshots = bricks.drop_duplicates("datetime", keep="last")
-    observations = []
-    latest = None
-    for row in snapshots.itertuples():
-        latest = dict(brick_time=str(row.datetime), close=float(row.close),
-                      high40=float(row.high40) if pd.notna(row.high40) else None,
-                      low20=float(row.low20) if pd.notna(row.low20) else None)
-        if str(row.datetime)[:10] == day:
-            observations.append(latest)
-    # Level history lets the executor recover a missed poll without moving decisions here.
-    return dict(**latest, data_asof=str(data_asof), history_bars=len(bars),
-                observations=observations)
+    latest = bricks.iloc[-1]
+    return dict(brick_time=str(latest["datetime"]), close=float(latest["close"]),
+                last_40_high=float(latest["high40"]) if pd.notna(latest["high40"]) else None,
+                last_20_low=float(latest["low20"]) if pd.notna(latest["low20"]) else None,
+                data_asof=str(data_asof))
 
 
 def publish(conn, collection, master, user, now):
     day = str(now.date())
-    key = signal_id(user, day)
+    key = signal_id(user)
     doc = collection.find_one({"_id": key})
-    if doc is None:
+    new_day = doc is None or pd.Timestamp(doc["updated_at"]).date() != now.date()
+    if doc is not None and pd.Timestamp(doc["updated_at"]) > pd.Timestamp(now):
+        raise ValueError("Cannot overwrite a newer signal day")
+    if new_day:
         index = dhan.fetch_candles(conn, 13, "IDX_I", "INDEX",
                                    now.replace(hour=0, minute=0, second=0, microsecond=0), now)
         locked = locked_contracts(master, index, day)
-        collection.update_one({"_id": key}, {"$setOnInsert": dict(
-            day=day, strategy_version=VERSION, **locked)}, upsert=True)
-        doc = collection.find_one({"_id": key})
-    if doc["strategy_version"] != VERSION:
+        values = dict(strategy_version=VERSION, ATM=locked["spot_0930_open"],
+                      STRIKE=locked["strike"], expiry=locked["expiry"], dte=locked["dte"])
+        for kind in ("CE", "PE"):
+            contract = locked["contracts"][kind]
+            values[kind + "_symbol"] = contract["symbol"]
+            values[kind + "_security_id"] = contract["security_id"]
+            values[kind + "_lot_size"] = contract["lot_size"]
+    else:
+        values = dict(doc)
+        values.pop("_id")
+        values.pop("day", None)
+    if values["strategy_version"] != VERSION:
         raise ValueError("Incompatible daily signal; do not overwrite its contract lock")
-    options = {}
     start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
     for kind in ("CE", "PE"):
-        security = doc["contracts"][kind]["security_id"]
+        security = values[kind + "_security_id"]
         bars = dhan.fetch_candles(conn, security, "NSE_FNO", "OPTIDX", start, now)
-        options[kind] = option_levels(bars, day, now)
-    collection.update_one({"_id": key}, {"$set": dict(
-        options=options, updated_at=str(now), broker="DHAN")})
+        for field, value in option_levels(bars, day, now).items():
+            values[kind + "_" + field] = value
+    values.update(updated_at=str(now), broker="DHAN")
+    # Publish both contracts together; failed history fetches leave the old day stale.
+    query = {"_id": key}
+    if doc is not None:
+        query["updated_at"] = doc["updated_at"]
+    changes = {"$set": values, "$unset": {"day": ""}}
+    if new_day:
+        changes["$unset"]["skip_day"] = ""
+    else:
+        # This marker belongs to the executor; do not copy an older value over it.
+        values.pop("skip_day", None)
+    result = collection.update_one(query, changes, upsert=doc is None)
+    if doc is not None and result.matched_count != 1:
+        raise ValueError("Signal day changed during publication; retry with the current lock")
     return collection.find_one({"_id": key})
 
 
@@ -181,11 +197,12 @@ def main():
                         master = dhan.load_instruments()
                         master_day = now.date()
                     doc = publish(conn, collection, master, config["user"], now)
-                    print(f"{doc['day']} ATM {doc['strike']} expiry {doc['expiry']}", flush=True)
+                    print(f"{doc['updated_at']} ATM {doc['STRIKE']} expiry {doc['expiry']}", flush=True)
                     for kind in ("CE", "PE"):
-                        levels = doc["options"][kind]
-                        print(f"{kind}: close={levels['close']} high40={levels['high40']} "
-                              f"low20={levels['low20']} asof={levels['data_asof']}", flush=True)
+                        print(f"{kind}: close={doc[kind + '_close']} "
+                              f"high40={doc[kind + '_last_40_high']} "
+                              f"low20={doc[kind + '_last_20_low']} "
+                              f"asof={doc[kind + '_data_asof']}", flush=True)
                     last_minute = minute
                 if last_error is not None:
                     notify(slack, "Nifty premium signal recovered")

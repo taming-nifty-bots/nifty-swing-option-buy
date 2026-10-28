@@ -14,18 +14,18 @@ strategy. Version: `premium-renko-levels-1pct-40-20-2026-10-28`.
 - Use **available exact-contract candles from14 calendar days** of history,
   normal session09:15-15:29 only. Missing history is not forward-filled.
 - Build **1% option-premium Renko** with the shared library.
-- Buy the first CE/PE to close strictly above its **prior40 bricks' high**.
+- Buy the first observed CE/PE latest close strictly above its **prior40 bricks' high**.
   Exclude the current brick from the channel; use the last brick of a multi-brick
   minute. Only fresh signals at/after09:30 qualify.
-- If both first break in the same completed minute, **skip the entire day**.
+- If both latest option levels qualify together, **skip the entire day**.
 - Exit the bought option on a close strictly below the **prior20 bricks' low**,
   or at **15:15 IST**. No target, fixed-rupee stop, partial booking, AFT/PCR,
   Supertrend filter or overnight holding.
 - **At most one trade per user/day**, including restarts and duplicate job runs.
-  Closed or aborted attempts consume the day. Do not chase an old first breakout.
+  Closed or aborted attempts consume the day.
 - Last eligible signal minute15:13; an entry must occur in the next minute,
-  strictly before15:15. A late-started executor misses the day rather than
-  switching to the other option.
+  strictly before15:15. After restart, evaluate the latest fresh levels, even if
+  an earlier breakout was missed. No historical breakout/exit replay.
 
 ## Preserved jobs and storage
 
@@ -37,23 +37,35 @@ strategy. Version: `premium-renko-levels-1pct-40-20-2026-10-28`.
 All strategy code lives in these **two existing scripts**, with no added shared
 module or test/configuration files. The signal job makes no trading decisions.
 
-Each completed minute, the signal job updates `options.CE` and `options.PE`:
-`close` is the latest **Renko close**, `high40`/`low20` exclude the current brick,
-`brick_time` identifies that brick and `data_asof` identifies the latest completed
-source candle. Levels stay available when no new brick forms. Channels are
-`null` until enough bricks exist; the executor does not enter without `high40`.
-`observations` contains today's final level snapshot for each brick-forming
-minute, so the executor can detect the first breakout or a missed exit after a
-restart. It contains chart data, not entry/exit flags.
-
-The executor compares `close > high40` for both options, saves its first decision
-in the daily signal document, and compares `close < low20` for the bought option.
-The signal job never overwrites that executor-owned decision.
-
 Mongo database remains `Bots`, with `nifty_swing_<user_name>` and
-`orders_nifty_swing_<user_name>`. Signal documents remain in `supertrend`, but use
-the new namespaced daily ID `NIFTY_premium_renko_<user_name>_<YYYY-MM-DD>`, not the
-old straddle documents or the credit bot's `NIFTY_Renko`.
+`orders_nifty_swing_<user_name>`. Signal data uses **one reusable document** in
+`supertrend`: `_id = NIFTY_premium_renko_<user_name>` (no date suffix).
+
+| Flat field | Meaning |
+|---|---|
+| `updated_at`, `strategy_version`, `broker` | Publication timestamp (also identifies session date) and identity |
+| `ATM`, `STRIKE`, `expiry`, `dte` |09:30 Nifty spot open, rounded ATM strike and selected expiry |
+| `CE_symbol`, `PE_symbol` | Exact dated option symbols |
+| `CE_security_id`, `PE_security_id` | Dhan security IDs |
+| `CE_lot_size`, `PE_lot_size` | Contract lot sizes |
+| `CE_close`, `PE_close` | Latest Renko closes |
+| `CE_last_40_high`, `PE_last_40_high` | High of40 prior bricks, excluding current brick |
+| `CE_last_20_low`, `PE_last_20_low` | Low of20 prior bricks, excluding current brick |
+| `CE_brick_time`, `PE_brick_time` | Latest Renko brick timestamps |
+| `CE_data_asof`, `PE_data_asof` | Latest completed source-candle timestamps |
+| `skip_day` | Executor-owned marker if both latest options qualify; cleared next day |
+
+Both options refresh together each completed minute. No chart-history arrays or
+stored first decision. Levels persist without new bricks; channels remain
+`null` until enough bricks exist. Executor compares the flat close/high/low
+fields. Entry needs a post09:30 brick and fresh completed source data, but the
+brick itself may be older than the latest source minute.
+
+On a new day, publisher re-locks09:30 ATM/expiry and replaces all session fields
+on the same document only after both charts succeed. Until then yesterday's
+`updated_at` date/freshness blocks execution. No separate `day` field is stored.
+Same-day restarts retain the contract lock. Old daily-ID
+documents are left untouched; no automatic deletion or production migration.
 
 The daily trade ID is deterministic and atomically inserted. Paper BUY/SELL order
 IDs are deterministic too, so a saved fill is reused if a process crashes before
@@ -132,14 +144,18 @@ python -m pip install -r OptionBuy\requirements.txt
 python -m compileall -q OptionBuy straddle
 ```
 
-Both dependency manifests pin `tamingnifty==2.3.2`. After simplifying to two
+Both dependency manifests pin `tamingnifty==2.3.2`. Before the fixed-document change,
+after simplifying to two
 scripts,28 offline checks pass, including exact published levels, strict
 breakout comparisons in the executor, updates without new bricks, insufficient
 history, candle causality, ATM/expiry, ties, daily cap, restart recovery, EOD,
 fees and image/workflow wiring. The check harness was run outside the strategy
 repository to respect the no-new-files request; it is not shipped or a pipeline
 test suite. The original CI workflow has no added validation steps; run the
-compilation command above locally.
+compilation command above locally. The subsequent fixed-document/latest-only
+change passed offline checks for exact flat Renko levels, atomic new-day refresh,
+failed-fetch preservation, latest-level restart behavior, ties, daily cap,
+paper entry/exit and fees. The earlier28-check result predates this schema change.
 
 Before simplification, the1%/prior40 first-option entry times matched the research
 harness on all five saved pilot sessions. This is not P&L proof: paper fills use
