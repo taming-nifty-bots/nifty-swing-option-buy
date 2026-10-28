@@ -26,8 +26,6 @@ def settings():
             raise ValueError("Missing environment variable: " + key)
     if os.environ.get("instrument_name", "NIFTY") != "NIFTY":
         raise ValueError("This strategy supports NIFTY only")
-    if os.environ.get("live_trading", "false").strip().lower() != "false":
-        raise ValueError("This strategy is paper-only; live_trading must be false")
     return dict(user=os.environ["user_name"], mongo=os.environ["CONNECTION_STRING"],
                 slack=os.environ["slack_token"])
 

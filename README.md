@@ -64,7 +64,8 @@ it explicitly before cutover.
 
 ## Paper execution and accounting
 
-**Paper only.** `live_trading` defaults to `false`; any other value is rejected.
+**Executor is paper only.** Its `live_trading` defaults to `false`; any other value
+is rejected. The signal job neither reads nor requires this flag; it places no orders.
 There is no real-order branch. Dhan authentication uses the shared token-aware
 `login_to_dhan`, never a forced fresh token on every poll.
 
@@ -108,7 +109,8 @@ The GitHub workflow is unchanged from the original pipeline. Keep its existing
 Azure/ACR/job deployment secrets; **do not add Dhan credentials to GitHub**.
 Configure `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP` directly on **both container
 jobs**, for the same account used by the shared token store. Prefer container-job
-secret references for sensitive values. Set `live_trading=false` on both jobs.
+secret references for sensitive values. Set `live_trading=false` on Option Buy
+only; the signal job does not use this flag.
 The pipeline updates images only, not job environment variables or secrets.
 
 Both jobs still need `CONNECTION_STRING`, `user_name`, `slack_token` in their

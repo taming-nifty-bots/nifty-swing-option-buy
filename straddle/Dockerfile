@@ -5,7 +5,6 @@ RUN apt-get update -y
 RUN apt-get upgrade -y
 # Change TimeZone
 ENV TZ=Asia/Calcutta
-ENV live_trading=false
 
 ENV user_name=sugam
 
