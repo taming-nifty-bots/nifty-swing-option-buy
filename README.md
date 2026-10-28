@@ -39,7 +39,9 @@ module or test/configuration files. The signal job makes no trading decisions.
 
 Mongo database remains `Bots`, with `nifty_swing_<user_name>` and
 `orders_nifty_swing_<user_name>`. Signal data uses **one reusable document** in
-`supertrend`: `_id = NIFTY_premium_renko_<user_name>` (no date suffix).
+`supertrend`: **`_id = nifty_options_renko`**, shared by both jobs, with no user
+name or date suffix. `user_name` still selects executor trade/order collections;
+configure it correctly on Option Buy.
 
 | Flat field | Meaning |
 |---|---|

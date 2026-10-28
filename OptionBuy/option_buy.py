@@ -14,6 +14,7 @@ from tamingnifty import utils as util
 from tamingnifty.charges import money, order_charges, sum_charges
 
 VERSION = "premium-renko-levels-1pct-40-20-2026-10-28"
+SIGNAL_ID = "nifty_options_renko"
 ACTIVE_STATES = ["pending", "active", "partial", "closing"]
 
 
@@ -42,10 +43,6 @@ def notify(client, message):
         print("Slack notification failed: " + util.exception_detail(error), flush=True)
 
 
-def signal_id(user):
-    return f"NIFTY_premium_renko_{user}"
-
-
 def trade_id(user, day):
     return f"{VERSION}:{user}:{day}"
 
@@ -66,7 +63,7 @@ def validate_quantity(quantity, lot_size):
 
 
 def fresh_signal(doc, user, now):
-    if (doc is None or doc.get("_id") != signal_id(user)
+    if (doc is None or doc.get("_id") != SIGNAL_ID
             or doc.get("strategy_version") != VERSION):
         raise ValueError("Missing or incompatible daily signal")
     if pd.Timestamp(doc["updated_at"]).date() != now.date():
@@ -226,7 +223,7 @@ def step(conn, strategies, orders, signals, user, quantity, now):
         reason = exit_reason(trade, None, now) if (
             now.strftime("%H:%M") >= "15:15" or trade["entry_date"] < str(now.date())) else None
         if reason is None:
-            doc = signals.find_one({"_id": signal_id(user)})
+            doc = signals.find_one({"_id": SIGNAL_ID})
             doc = fresh_signal(doc, user, now)
             reason = exit_reason(trade, doc, now)
         if reason:
@@ -241,7 +238,7 @@ def step(conn, strategies, orders, signals, user, quantity, now):
         return None
     if strategies.find_one({"entry_date": str(now.date())}) is not None:
         return None
-    doc = signals.find_one({"_id": signal_id(user)})
+    doc = signals.find_one({"_id": SIGNAL_ID})
     doc = fresh_signal(doc, user, now)
     if doc.get("skip_day"):
         return None

@@ -13,6 +13,7 @@ from tamingnifty import ta
 from tamingnifty import utils as util
 
 VERSION = "premium-renko-levels-1pct-40-20-2026-10-28"
+SIGNAL_ID = "nifty_options_renko"
 
 
 def now_ist():
@@ -36,10 +37,6 @@ def notify(client, message):
         util.notify(message=message, slack_client=client, slack_channel="niftyswing")
     except Exception as error:
         print("Slack notification failed: " + util.exception_detail(error), flush=True)
-
-
-def signal_id(user):
-    return f"NIFTY_premium_renko_{user}"
 
 
 def locked_contracts(master, index, day):
@@ -126,7 +123,7 @@ def option_levels(candles, day, now):
 
 def publish(conn, collection, master, user, now):
     day = str(now.date())
-    key = signal_id(user)
+    key = SIGNAL_ID
     doc = collection.find_one({"_id": key})
     new_day = doc is None or pd.Timestamp(doc["updated_at"]).date() != now.date()
     if doc is not None and pd.Timestamp(doc["updated_at"]) > pd.Timestamp(now):
