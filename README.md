@@ -2,7 +2,7 @@
 
 The repository/job names stay unchanged. The strategy is now **intraday Nifty
 option-premium Renko buying on Dhan**, not the former Definedge straddle/PnF swing
-strategy. Version: `premium-renko-levels-1pct-40-20-2026-10-28`.
+strategy. Version: `premium-renko-levels-1pct-20-20-2026-10-29`.
 
 ## Frozen rules
 
@@ -14,7 +14,7 @@ strategy. Version: `premium-renko-levels-1pct-40-20-2026-10-28`.
 - Use **available exact-contract candles from14 calendar days** of history,
   normal session09:15-15:29 only. Missing history is not forward-filled.
 - Build **1% option-premium Renko** with the shared library.
-- Buy the first observed CE/PE latest close strictly above its **prior40 bricks' high**.
+- Buy the first observed CE/PE latest close strictly above its **prior20 bricks' high**.
   Exclude the current brick from the channel; use the last brick of a multi-brick
   minute. Only fresh signals at/after09:30 qualify.
 - If both latest option levels qualify together, **skip the entire day**.
@@ -31,8 +31,8 @@ strategy. Version: `premium-renko-levels-1pct-40-20-2026-10-28`.
 
 | Existing path/job | New responsibility |
 |---|---|
-| `straddle/straddle.py` / signal job | Lock09:30 ATM/expiry, form CE/PE charts, update `close`, `high40`, `low20` in Mongo |
-| `OptionBuy/option_buy.py` / execution job | Read Mongo levels, decide breakouts/entries/exits, manage one paper trade and net P&L |
+| `straddle/straddle.py` / signal job | Lock09:30 ATM/expiry, form CE/PE charts, update `close`, `high20`, `low20` in Mongo |
+| `OptionBuy/option_buy.py` / execution job | Read Mongo levels, decide breakouts/entries/exits, manage one trade and net P&L |
 
 All strategy code lives in these **two existing scripts**, with no added shared
 module or test/configuration files. The signal job makes no trading decisions.
@@ -51,7 +51,7 @@ configure it correctly on Option Buy.
 | `CE_security_id`, `PE_security_id` | Dhan security IDs |
 | `CE_lot_size`, `PE_lot_size` | Contract lot sizes |
 | `CE_close`, `PE_close` | Latest Renko closes |
-| `CE_last_40_high`, `PE_last_40_high` | High of40 prior bricks, excluding current brick |
+| `CE_last_20_high`, `PE_last_20_high` | High of20 prior bricks, excluding current brick |
 | `CE_last_20_low`, `PE_last_20_low` | Low of20 prior bricks, excluding current brick |
 | `CE_brick_time`, `PE_brick_time` | Latest Renko brick timestamps |
 | `CE_data_asof`, `PE_data_asof` | Latest completed source-candle timestamps |
@@ -73,34 +73,70 @@ The daily trade ID is deterministic and atomically inserted. Paper BUY/SELL orde
 IDs are deterministic too, so a saved fill is reused if a process crashes before
 updating the trade. A failed/expired pending entry cannot cause another buy.
 Historical trades/orders are not deleted or rewritten. An open legacy/partial
-position or non-paper position **blocks the new strategy** with an alert; reconcile
+position or different-mode position **blocks the new strategy** with an alert; reconcile
 it explicitly before cutover.
 
-## Paper execution and accounting
+## Execution and accounting
 
-**Executor is paper only.** Its `live_trading` defaults to `false`; any other value
-is rejected. The signal job neither reads nor requires this flag; it places no orders.
-There is no real-order branch. Dhan authentication uses the shared token-aware
-`login_to_dhan`, never a forced fresh token on every poll.
+**One executor switch:** `live_trading=false` (default) records simulated fills;
+`live_trading=true` submits Dhan orders. Invalid values are rejected. Keep the
+container job set to `false` for the current forward test. The signal job does
+not use the flag. Mode is recorded on each trade; changing the job's mode while
+a trade is open stops execution with a reconciliation alert, not a mode conversion.
+Dhan authentication uses the shared token-aware `login_to_dhan`, never a forced
+fresh token on every poll.
 
 Only completed one-minute candles form signals. After observing the signal, the
 executor records the **current Dhan option LTP** as the paper fill during the next
 minute. It does **not** backdate a fill to the historical next-minute open.
 The quote receipt time is recorded; a slow BUY response that crosses its entry
 minute or15:15 is rejected rather than recorded with an earlier timestamp.
-There is no extra synthetic slippage haircut in this forward record: LTP still
+There is no extra synthetic slippage haircut in simulated fills: LTP still
 does not model bid/ask or executable liquidity, and Dhan's LTP helper does not
 provide a quote timestamp. Research results are not promised to reproduce.
+
+Live execution uses shared `place_order`/`wait_for_fill`, with actual average
+fill prices only after `TRADED` and full `filledQty` validation. Before sending,
+an atomic order intent reserves the deterministic BUY/SELL ID. A saved broker
+ID is polled after restart, never resubmitted. An intent without a broker ID
+(including an ambiguous timeout/crash) requires manual broker reconciliation.
+Rejected, cancelled or partial fills alert and block rather than creating a
+duplicate order or claiming a full position/closure; a partial position may still
+be exposed and requires prompt manual attention. There is no automatic residual
+order or partial-fill accounting/final P&L. Exit intent/reason persists so restart
+continues that exit even if its channel signal disappears. Actual fills may occur
+after the entry window; the live check limits **submission**, not exchange fill
+time. Recorded live entry/exit timestamps are local confirmed-fill observation
+times, not backdated broker placement times.
 
 `pnl` remains gross. `tamingnifty.charges` supplies itemized `charges`, and
 `net_pnl = pnl - charges.total`. An active trade has zero realized gross and its
 entry fees; `running_pnl` is the current gross mark, not realized P&L. Closed
-records include both executed paper orders' fees; no flat fee, charge schedule or
+records include both executed orders' fees; no flat fee, charge schedule or
 estimate metadata fields are added.
+
+## Monitoring
+
+- Both jobs announce startup/public IP, hourly state, changed errors immediately,
+  repeated errors every15 minutes, recovery and closing bell. Mode appears once
+  at executor startup, not in every routine notification.
+- Signal alerts show the locked ATM/expiry and both close/high20/low20/source
+  timestamps; the first successful publication announces charts ready.
+- Entry/exit messages show symbol, quantity and net-first P&L; entry includes time
+  and price, closure includes charges and reason.
+- `running_net_pnl` estimates liquidation net using filled entry plus a hypothetical
+  exit's charges. It does not replace realized `net_pnl`. Persistent
+  `max_pnl_reached`/`min_pnl_reached` track gross marks; `max_net_pnl_reached`/
+  `min_net_pnl_reached` track estimated net marks. They include entry and final
+  fills, survive restarts, and reflect **observed** polling marks, not true
+  tick-by-tick extremes. Errors/stale signals can leave gaps; heartbeat errors
+  explicitly label the last good state rather than present it as fresh.
 
 Stale/missing signals block entry and ordinary channel exits and alert explicitly.
 **15:15 closure does not depend on the signal job**; if a quote/API fails the
-executor keeps retrying rather than marking the position closed. It stays running
+executor keeps monitoring/reconciling rather than marking the position closed.
+Live submission uncertainty still requires manual reconciliation, not resubmission.
+It stays running
 after15:16 while any pending/open position exists. An overdue new-era position is
 closed at the next available quote; this is recovery, not an overnight rule.
 Neither the exact15:15 fill time nor a maximum monetary loss is guaranteed.
@@ -124,7 +160,8 @@ Azure/ACR/job deployment secrets; **do not add Dhan credentials to GitHub**.
 Configure `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP` directly on **both container
 jobs**, for the same account used by the shared token store. Prefer container-job
 secret references for sensitive values. Set `live_trading=false` on Option Buy
-only; the signal job does not use this flag.
+only for the current test; use `true` there only when intentionally enabling
+real orders. The signal job does not use this flag.
 The pipeline updates images only, not job environment variables or secrets.
 
 Both jobs still need `CONNECTION_STRING`, `user_name`, `slack_token` in their
@@ -163,11 +200,29 @@ Before simplification, the1%/prior40 first-option entry times matched the resear
 harness on all five saved pilot sessions. This is not P&L proof: paper fills use
 current LTP and the new requested EOD is15:15 rather than the pilot's15:20.
 
-**Paper-only source; deployment readiness must be verified separately.**
+### October29 update (local, not pushed)
+
+Owner selected1%20/20 after the seven-session grid; this is a forward-test choice,
+not proof of edge. Eight offline regression groups cover prior20 causality,
+freshness/ties, both execution modes, confirmed live fills (mocked only),
+ambiguous submissions, partial/rejected fills, order/restart recovery, daily cap,
+EOD, extrema/net fees, IP/status/error/recovery/closing-bell notifications and
+same-day signal-lock preservation. No real orders were sent during testing.
+
+Updated the shared Mongo snapshot with recomputed20-highs (CE376.62/PE200.20)
+from its exact cached contracts at the original October28 cutoff; removed40-high
+fields. Preserved contracts, ATM/expiry and `updated_at`2026-10-28 15:15:00.879127.
+This intentionally remains stale until the next successful daily publication.
+Trades/orders and container variables were not changed.
+
+**Deployment readiness must be verified separately.**
 Pushing master triggers the unchanged deployment workflow. Configure Dhan
-variables on both container jobs before starting the new images.
+variables on both container jobs before starting the new images. Update both
+jobs together: an old publisher can overwrite the shared document with its old
+version/fields, which the new executor will reject.
 Docker daemon was unavailable, so actual image builds/Azure deployment are not
 validated locally. No strategy loop was started, no broker order was sent, no
-token rotated and no production Mongo record changed during implementation.
+token rotated during this update. The snapshot migration above is the only
+production Mongo change.
 The new era needs its own forward sample; historical swing results and the
 coverage-limited premium study do not validate its profitability.

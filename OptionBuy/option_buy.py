@@ -13,7 +13,7 @@ from tamingnifty import connect_dhan as dhan
 from tamingnifty import utils as util
 from tamingnifty.charges import money, order_charges, sum_charges
 
-VERSION = "premium-renko-levels-1pct-40-20-2026-10-28"
+VERSION = "premium-renko-levels-1pct-20-20-2026-10-29"
 SIGNAL_ID = "nifty_options_renko"
 ACTIVE_STATES = ["pending", "active", "partial", "closing"]
 
@@ -29,10 +29,11 @@ def settings():
             raise ValueError("Missing environment variable: " + key)
     if os.environ.get("instrument_name", "NIFTY") != "NIFTY":
         raise ValueError("This strategy supports NIFTY only")
-    if os.environ.get("live_trading", "false").strip().lower() != "false":
-        raise ValueError("This strategy is paper-only; live_trading must be false")
+    mode = os.environ.get("live_trading", "false").strip().lower()
+    if mode not in ("true", "false"):
+        raise ValueError("live_trading must be true or false")
     return dict(user=os.environ["user_name"], mongo=os.environ["CONNECTION_STRING"],
-                slack=os.environ["slack_token"])
+                slack=os.environ["slack_token"], simulated=mode == "false")
 
 
 def notify(client, message):
@@ -82,7 +83,7 @@ def first_decision(doc):
     found = []
     for kind in ("CE", "PE"):
         brick = pd.Timestamp(doc[kind + "_brick_time"])
-        high = doc[kind + "_last_40_high"]
+        high = doc[kind + "_last_20_high"]
         if (brick >= pd.Timestamp(doc["updated_at"]).normalize() + pd.Timedelta(hours=9, minutes=30)
                 and high is not None and doc[kind + "_close"] > high):
             found.append((doc[kind + "_data_asof"], kind))
@@ -90,7 +91,7 @@ def first_decision(doc):
         return None
     found.sort()
     if len(found) == 2:
-        return dict(status="skip", reason="both_latest_levels_above_high40", signal_time=found[0][0])
+        return dict(status="skip", reason="both_latest_levels_above_high20", signal_time=found[0][0])
     return dict(status="entry", option_type=found[0][1], signal_time=found[0][0])
 
 
@@ -123,8 +124,10 @@ def exit_reason(trade, doc, now):
     return None
 
 
-def paper_order(conn, orders, key, contract, quantity, side, now):
+def execute_order(conn, orders, key, contract, quantity, side, now, simulated):
     existing = orders.find_one({"_id": key})
+    if not simulated:
+        return live_order(conn, orders, key, contract, quantity, side, now, existing)
     if existing is not None:
         return existing
     price = valid_price(dhan.get_option_ltp(conn, contract["security_id"]))
@@ -132,7 +135,7 @@ def paper_order(conn, orders, key, contract, quantity, side, now):
     if side == "BUY":
         deadline = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
         if not now <= filled_at < deadline or filled_at.strftime("%H:%M") >= "15:15":
-            raise ValueError("Quote arrived outside the entry minute; no paper buy recorded")
+            raise ValueError("Quote arrived outside the entry minute; no buy recorded")
     order = dict(_id=key, orderId=key, orderStatus="TRADED", transactionType=side,
                  securityId=contract["security_id"], tradingSymbol=contract["symbol"],
                  exchangeSegment="NSE_FNO", quantity=quantity, filledQty=quantity,
@@ -145,7 +148,50 @@ def paper_order(conn, orders, key, contract, quantity, side, now):
     return order
 
 
-def claim_entry(strategies, doc, user, quantity, now):
+def live_order(conn, orders, key, contract, quantity, side, now, existing):
+    if existing is None:
+        if side == "BUY" and not now <= now_ist() < now.replace(
+                second=0, microsecond=0) + timedelta(minutes=1):
+            raise ValueError("Order submission missed the entry minute")
+        intent = dict(_id=key, orderStatus="SUBMITTING", transactionType=side,
+                      securityId=contract["security_id"], tradingSymbol=contract["symbol"],
+                      quantity=quantity, simulated=False, strategy_version=VERSION)
+        try:
+            orders.insert_one(intent)
+        except DuplicateKeyError:
+            existing = orders.find_one({"_id": key})
+        else:
+            # Never resubmit after an ambiguous response or a crash after sending.
+            placed = dhan.place_order(conn, contract["security_id"], side, quantity)
+            if not placed.get("orderId"):
+                raise ValueError(f"Order response has no ID; reconcile intent {key} with Dhan")
+            orders.update_one({"_id": key}, {"$set": placed})
+            existing = orders.find_one({"_id": key})
+    if not existing or existing.get("simulated") is not False or not existing.get("orderId"):
+        raise ValueError(f"Unconfirmed order submission {key}; reconcile with Dhan before retrying")
+    if existing.get("orderStatus") == "TRADED" and existing.get("fill_timestamp"):
+        order = existing
+    else:
+        order = dhan.wait_for_fill(conn, existing["orderId"], slack_channel="niftyswing")
+        if str(order.get("orderId")) != str(existing["orderId"]):
+            raise ValueError(f"Broker returned a different order for {existing['orderId']}; reconcile with Dhan")
+        if order.get("orderStatus") == "TRADED":
+            order["fill_timestamp"] = str(now_ist())
+        orders.update_one({"_id": key}, {"$set": order})
+        order = orders.find_one({"_id": key})
+    if (str(order.get("securityId")) != str(contract["security_id"])
+            or order.get("transactionType") != side or order.get("quantity") != quantity):
+        raise ValueError(f"Order {order['orderId']} contract/side/quantity mismatch; reconcile with Dhan")
+    if order.get("orderStatus") != "TRADED" or order.get("filledQty") != quantity:
+        raise ValueError(
+            f"Order {order['orderId']} {order.get('orderStatus')}: "
+            f"filled {order.get('filledQty', 0)}/{quantity}; "
+            f"{order.get('omsErrorDescription', '')}. Reconcile with Dhan; no duplicate order will be sent")
+    valid_price(order["averageTradedPrice"])
+    return order
+
+
+def claim_entry(strategies, doc, user, quantity, now, simulated=True):
     decision = first_decision(doc)
     if not entry_is_current(decision, now):
         return None
@@ -157,7 +203,7 @@ def claim_entry(strategies, doc, user, quantity, now):
                     lot_size=doc[kind + "_lot_size"])
     qty = validate_quantity(quantity, contract["lot_size"])
     trade = dict(_id=trade_id(user, str(now.date())), strategy_version=VERSION,
-                 instrument_name="NIFTY", broker="DHAN", simulated=True,
+                 instrument_name="NIFTY", broker="DHAN", simulated=simulated,
                  strategy_state="pending", entry_date=str(now.date()), entry_signal=decision["signal_time"],
                  option_type=kind, trend="Bullish" if kind == "CE" else "Bearish",
                  strike=doc["STRIKE"], expiry=doc["expiry"], dte=doc["dte"],
@@ -179,60 +225,118 @@ def open_pending(conn, strategies, orders, trade, now):
         strategies.update_one({"_id": trade["_id"], "strategy_state": "pending"},
                               {"$set": dict(strategy_state="aborted",
                                              exit_reason="Missed next-minute entry window")})
-        raise ValueError("Pending paper entry expired; daily slot remains consumed")
+        raise ValueError("Pending entry expired; daily slot remains consumed")
     contract = dict(security_id=trade["security_id"], symbol=trade["long_option_symbol"])
-    order = paper_order(conn, orders, key, contract, trade["quantity"], "BUY", now)
+    order = execute_order(conn, orders, key, contract, trade["quantity"], "BUY", now, trade["simulated"])
     price = valid_price(order["averageTradedPrice"])
+    filled_at = order.get("fill_timestamp", order.get("createTime"))
+    if filled_at is None:
+        raise ValueError("Filled entry is missing its confirmation timestamp")
     entry_fees = order_charges("options", "BUY", price, trade["quantity"])
-    strategies.update_one({"_id": trade["_id"], "strategy_state": "pending"}, {"$set": dict(
+    marked_trade = dict(trade, long_option_cost=price)
+    updates = pnl_updates(marked_trade, price, pd.Timestamp(filled_at).to_pydatetime())
+    updates["$set"].update(
         strategy_state="active", long_option_cost=price, entry_order_id=key,
-        entry_timestamp=order["createTime"], entry_time=order["createTime"][11:19],
+        entry_timestamp=filled_at, entry_time=filled_at[11:19],
         total_investment=money(price * trade["quantity"]), charges=sum_charges(entry_fees),
-        pnl=0.0, net_pnl=-entry_fees["total"], running_pnl=0.0)})
+        pnl=0.0, net_pnl=-entry_fees["total"])
+    strategies.update_one({"_id": trade["_id"], "strategy_state": "pending"}, updates)
+
+
+def pnl_updates(trade, price, now):
+    gross = money(trade["quantity"] * (price - trade["long_option_cost"]))
+    fees = sum_charges(
+        order_charges("options", "BUY", trade["long_option_cost"], trade["quantity"]),
+        order_charges("options", "SELL", price, trade["quantity"]))
+    net = money(gross - fees["total"])
+    # Net mark assumes closing now; realized fields still count only filled orders.
+    return {
+        "$set": dict(running_pnl=gross, running_net_pnl=net, last_mark=str(now)),
+        "$max": dict(max_pnl_reached=gross, max_net_pnl_reached=net),
+        "$min": dict(min_pnl_reached=gross, min_net_pnl_reached=net),
+    }
+
+
+def status_message(strategies, now):
+    trade = strategies.find_one({"strategy_state": {"$in": ACTIVE_STATES}})
+    if trade is None:
+        trade = strategies.find_one({"entry_date": str(now.date())})
+    if trade is None:
+        return "FLAT | no trade today"
+    state = trade["strategy_state"]
+    text = f"{state.upper()} | {trade['long_option_symbol']} x{trade['quantity']}"
+    if state == "pending":
+        return text + " | reconciling entry"
+    if state == "aborted":
+        return text + " | " + trade["exit_reason"] + " | daily slot consumed"
+    if state not in ("active", "closed") or "running_net_pnl" not in trade:
+        return text + " | P&L monitoring unavailable; reconcile legacy/accounting state"
+    text += (f" | net {'realized' if state == 'closed' else 'if closed now (estimated)'} "
+             f"Rs{trade['running_net_pnl']:.2f} | gross Rs{trade['running_pnl']:.2f}"
+             f" | observed net max/min Rs{trade['max_net_pnl_reached']:.2f}"
+             f"/{trade['min_net_pnl_reached']:.2f}"
+             f" | observed gross max/min Rs{trade['max_pnl_reached']:.2f}"
+             f"/{trade['min_pnl_reached']:.2f}"
+             f" | entry {trade['entry_time']} @ {trade['long_option_cost']:.2f}"
+             f" | mark {trade['last_mark']}")
+    if state == "closed":
+        text += (f" | exit {trade['exit_time']} @ {trade['long_exit_price']:.2f}"
+                 f" | charges Rs{trade['charges']['total']:.2f} | {trade['exit_reason']}")
+    return text
 
 
 def close_trade(conn, strategies, orders, trade, reason, now):
     contract = dict(security_id=trade["security_id"], symbol=trade["long_option_symbol"])
     key = trade["_id"] + ":SELL"
-    order = paper_order(conn, orders, key, contract, trade["quantity"], "SELL", now)
+    strategies.update_one({"_id": trade["_id"], "strategy_state": "active"},
+                          {"$set": dict(strategy_state="closing", exit_reason=reason)})
+    order = execute_order(conn, orders, key, contract, trade["quantity"], "SELL", now, trade["simulated"])
     price = valid_price(order["averageTradedPrice"])
     gross = money(trade["quantity"] * (price - trade["long_option_cost"]))
     fees = sum_charges(
         order_charges("options", "BUY", trade["long_option_cost"], trade["quantity"]),
         order_charges("options", "SELL", price, trade["quantity"]))
-    strategies.update_one({"_id": trade["_id"], "strategy_state": {"$in": ["active", "closing"]}},
-                          {"$set": dict(strategy_state="closed", long_exit_price=price,
-                                        exit_date=order["createTime"][:10],
-                                        exit_time=order["createTime"][11:19],
-                                        exit_timestamp=order["createTime"], exit_order_id=key,
+    filled_at = order.get("fill_timestamp", order.get("createTime"))
+    if filled_at is None:
+        raise ValueError("Filled exit is missing its confirmation timestamp")
+    updates = pnl_updates(trade, price, pd.Timestamp(filled_at).to_pydatetime())
+    updates["$set"].update(strategy_state="closed", long_exit_price=price,
+                                        exit_date=filled_at[:10],
+                                        exit_time=filled_at[11:19],
+                                        exit_timestamp=filled_at, exit_order_id=key,
                                         exit_reason=reason, pnl=gross, running_pnl=gross,
-                                        charges=fees, net_pnl=money(gross - fees["total"]))})
+                                        charges=fees, net_pnl=money(gross - fees["total"]))
+    strategies.update_one({"_id": trade["_id"], "strategy_state": {"$in": ["active", "closing"]}},
+                          updates)
 
 
-def step(conn, strategies, orders, signals, user, quantity, now):
+def step(conn, strategies, orders, signals, user, quantity, now, simulated=True):
     active = list(strategies.find({"strategy_state": {"$in": ACTIVE_STATES}}))
     if len(active) > 1:
         raise ValueError("Multiple open/reserved swing positions; manual reconciliation required")
     if active:
         trade = active[0]
-        if trade.get("strategy_version") != VERSION or trade.get("simulated") is not True:
-            raise ValueError("Legacy or non-paper open position: reconcile before running the new strategy")
+        if trade.get("strategy_version") != VERSION or trade.get("simulated") != simulated:
+            raise ValueError("Legacy or different-mode open position: reconcile before running the strategy")
         if trade["strategy_state"] == "pending":
             open_pending(conn, strategies, orders, trade, now)
-            return "Pending entry reconciled"
-        reason = exit_reason(trade, None, now) if (
-            now.strftime("%H:%M") >= "15:15" or trade["entry_date"] < str(now.date())) else None
+            return "Pending entry reconciled | " + status_message(strategies, now)
+        if trade["strategy_state"] == "partial":
+            raise ValueError("Partial position requires reconciliation before further orders")
+        reason = trade.get("exit_reason") if trade["strategy_state"] == "closing" else None
+        if reason is None and (
+                now.strftime("%H:%M") >= "15:15" or trade["entry_date"] < str(now.date())):
+            reason = exit_reason(trade, None, now)
         if reason is None:
             doc = signals.find_one({"_id": SIGNAL_ID})
             doc = fresh_signal(doc, user, now)
             reason = exit_reason(trade, doc, now)
         if reason:
             close_trade(conn, strategies, orders, trade, reason, now)
-            return "Position closed: " + reason
+            return "Position closed | " + status_message(strategies, now)
         price = valid_price(dhan.get_option_ltp(conn, trade["security_id"]))
-        running = money(trade["quantity"] * (price - trade["long_option_cost"]))
         strategies.update_one({"_id": trade["_id"], "strategy_state": "active"},
-                              {"$set": {"running_pnl": running, "last_mark": str(now)}})
+                              pnl_updates(trade, price, now_ist()))
         return None
     if now.weekday() >= 5 or now.strftime("%H:%M") < "09:31" or now.strftime("%H:%M") >= "15:15":
         return None
@@ -246,11 +350,11 @@ def step(conn, strategies, orders, signals, user, quantity, now):
     if decision is not None and decision["status"] == "skip":
         signals.update_one({"_id": doc["_id"], "updated_at": doc["updated_at"]},
                            {"$set": {"skip_day": True}})
-        return "Both latest option levels exceed high40; skip today"
-    trade = claim_entry(strategies, doc, user, quantity, now)
+        return "Both latest option levels exceed high20; skip today"
+    trade = claim_entry(strategies, doc, user, quantity, now, simulated)
     if trade is not None:
         open_pending(conn, strategies, orders, trade, now)
-        return f"Paper buy {trade['long_option_symbol']}, quantity {trade['quantity']}"
+        return "Bought | " + status_message(strategies, now)
     return None
 
 
@@ -269,8 +373,11 @@ def main():
     last_error = None
     last_alert = now_ist()
     heartbeat = now_ist()
-    notify(slack, f"Nifty premium executor started: {VERSION}; PAPER ONLY")
+    latest_state = "Waiting for first pass"
     try:
+        mode = "paper" if config["simulated"] else "live"
+        notify(slack, f"Nifty premium executor started: {VERSION};1%20/20; {mode}; quantity {quantity}")
+        notify(slack, f"Nifty premium executor public IP: {util.get_public_ip()}")
         while True:
             now = now_ist()
             try:
@@ -279,22 +386,33 @@ def main():
                     break
                 if now.strftime("%H:%M") >= "09:15":
                     conn = dhan.login_to_dhan(slack_channel="niftyswing")
-                    message = step(conn, strategies, orders, signals, config["user"], quantity, now_ist())
+                    message = step(conn, strategies, orders, signals, config["user"], quantity,
+                                   now_ist(), config["simulated"])
+                    latest_state = status_message(strategies, now_ist())
+                    signal = signals.find_one({"_id": SIGNAL_ID})
+                    if signal is not None:
+                        latest_state += f" | signal updated {signal['updated_at']}"
+                        if signal.get("skip_day"):
+                            latest_state += " | dual breakout: skip today"
                     if message:
                         notify(slack, message)
                 if last_error is not None:
                     notify(slack, "Nifty premium executor recovered")
                     last_error = None
-                if now - heartbeat >= timedelta(hours=1):
-                    notify(slack, "Nifty premium executor alive; paper mode, one trade/day")
-                    heartbeat = now
             except Exception as error:
                 message = util.exception_detail(error)
                 print(message, flush=True)
                 if message != last_error or now - last_alert >= timedelta(minutes=15):
                     notify(slack, "Nifty premium executor error: " + message)
                     last_error, last_alert = message, now
+            if now - heartbeat >= timedelta(hours=1):
+                state = latest_state
+                if last_error is not None:
+                    state = "ERROR: " + last_error + " | last good state: " + latest_state
+                notify(slack, "Nifty premium executor alive | " + state)
+                heartbeat = now
             time.sleep(10)
+        notify(slack, "Nifty premium executor closing bell | " + status_message(strategies, now_ist()))
     finally:
         client.close()
 

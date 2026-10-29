@@ -12,7 +12,7 @@ from tamingnifty import connect_dhan as dhan
 from tamingnifty import ta
 from tamingnifty import utils as util
 
-VERSION = "premium-renko-levels-1pct-40-20-2026-10-28"
+VERSION = "premium-renko-levels-1pct-20-20-2026-10-29"
 SIGNAL_ID = "nifty_options_renko"
 
 
@@ -112,11 +112,11 @@ def option_levels(candles, day, now):
     bricks = ta.convert_to_renko(brick_size=1, df=bars.copy())
     if bricks.empty:
         raise ValueError("Not enough history to form Renko")
-    bricks["high40"] = bricks["high"].shift(1).rolling(40).max()
+    bricks["high20"] = bricks["high"].shift(1).rolling(20).max()
     bricks["low20"] = bricks["low"].shift(1).rolling(20).min()
     latest = bricks.iloc[-1]
     return dict(brick_time=str(latest["datetime"]), close=float(latest["close"]),
-                last_40_high=float(latest["high40"]) if pd.notna(latest["high40"]) else None,
+                last_20_high=float(latest["high20"]) if pd.notna(latest["high20"]) else None,
                 last_20_low=float(latest["low20"]) if pd.notna(latest["low20"]) else None,
                 data_asof=str(data_asof))
 
@@ -143,6 +143,8 @@ def publish(conn, collection, master, user, now):
         values = dict(doc)
         values.pop("_id")
         values.pop("day", None)
+        values.pop("CE_last_40_high", None)
+        values.pop("PE_last_40_high", None)
     if values["strategy_version"] != VERSION:
         raise ValueError("Incompatible daily signal; do not overwrite its contract lock")
     start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
@@ -156,7 +158,8 @@ def publish(conn, collection, master, user, now):
     query = {"_id": key}
     if doc is not None:
         query["updated_at"] = doc["updated_at"]
-    changes = {"$set": values, "$unset": {"day": ""}}
+    changes = {"$set": values, "$unset": {
+        "day": "", "CE_last_40_high": "", "PE_last_40_high": ""}}
     if new_day:
         changes["$unset"]["skip_day"] = ""
     else:
@@ -180,8 +183,11 @@ def main():
     last_error = None
     last_alert = now_ist()
     heartbeat = now_ist()
-    notify(slack, f"Nifty premium Renko signal started: {VERSION}; Dhan, paper-only")
+    latest_state = "Waiting for completed09:30 candles"
+    published_day = None
     try:
+        notify(slack, f"Nifty premium Renko signal started: {VERSION};1%20/20; no orders")
+        notify(slack, f"Nifty premium signal public IP: {util.get_public_ip()}")
         while True:
             now = now_ist()
             try:
@@ -194,26 +200,34 @@ def main():
                         master = dhan.load_instruments()
                         master_day = now.date()
                     doc = publish(conn, collection, master, config["user"], now)
-                    print(f"{doc['updated_at']} ATM {doc['STRIKE']} expiry {doc['expiry']}", flush=True)
+                    latest_state = f"ATM {doc['STRIKE']} | expiry {doc['expiry']} | updated {doc['updated_at']}"
                     for kind in ("CE", "PE"):
-                        print(f"{kind}: close={doc[kind + '_close']} "
-                              f"high40={doc[kind + '_last_40_high']} "
-                              f"low20={doc[kind + '_last_20_low']} "
-                              f"asof={doc[kind + '_data_asof']}", flush=True)
+                        latest_state += (f" | {kind} close={doc[kind + '_close']} "
+                                         f"high20={doc[kind + '_last_20_high']} "
+                                         f"low20={doc[kind + '_last_20_low']} "
+                                         f"asof={doc[kind + '_data_asof']}")
+                    print(latest_state, flush=True)
+                    if published_day != now.date():
+                        notify(slack, "Nifty premium charts ready | " + latest_state)
+                        published_day = now.date()
                     last_minute = minute
                 if last_error is not None:
                     notify(slack, "Nifty premium signal recovered")
                     last_error = None
-                if now - heartbeat >= timedelta(hours=1):
-                    notify(slack, "Nifty premium signal alive; waiting/publishing completed minutes")
-                    heartbeat = now
             except Exception as error:
                 message = util.exception_detail(error)
                 print(message, flush=True)
                 if message != last_error or now - last_alert >= timedelta(minutes=15):
                     notify(slack, "Nifty premium signal error: " + message)
                     last_error, last_alert = message, now
+            if now - heartbeat >= timedelta(hours=1):
+                state = latest_state
+                if last_error is not None:
+                    state = "ERROR: " + last_error + " | last good state: " + latest_state
+                notify(slack, "Nifty premium signal alive | " + state)
+                heartbeat = now
             time.sleep(10)
+        notify(slack, "Nifty premium signal closing bell | " + latest_state)
     finally:
         client.close()
 
