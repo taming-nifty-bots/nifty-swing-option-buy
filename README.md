@@ -117,20 +117,31 @@ estimate metadata fields are added.
 
 ## Monitoring
 
-- Both jobs announce startup/public IP, hourly state, changed errors immediately,
-  repeated errors every15 minutes, recovery and closing bell. Mode appears once
-  at executor startup, not in every routine notification.
-- Signal alerts show the locked ATM/expiry and both close/high20/low20/source
-  timestamps; the first successful publication announces charts ready.
-- Entry/exit messages show symbol, quantity and net-first P&L; entry includes time
-  and price, closure includes charges and reason.
+- Each job combines startup/public IP into one short alert. Hourly state,
+  changed errors immediately, repeated errors every15 minutes and recovery remain.
+  Executor mode appears only at startup.
+- Signal alerts show ATM/expiry and update time, not every channel value. Full
+  close/high20/low20/source details remain in console logs and Mongo.
+- Executor alerts show symbol/quantity, entry time/price, estimated net and net
+  max/min. Final summary adds exit time/price, realized net, gross, charges and
+  reason. Gross extrema and full timestamps remain stored, not repeated in Slack.
 - `running_net_pnl` estimates liquidation net using filled entry plus a hypothetical
   exit's charges. It does not replace realized `net_pnl`. Persistent
   `max_pnl_reached`/`min_pnl_reached` track gross marks; `max_net_pnl_reached`/
   `min_net_pnl_reached` track estimated net marks. They include entry and final
   fills, survive restarts, and reflect **observed** polling marks, not true
   tick-by-tick extremes. Errors/stale signals can leave gaps; heartbeat errors
-  explicitly label the last good state rather than present it as fresh.
+  show the current error rather than repeating an old position snapshot.
+
+Both jobs exit once today's trade is confirmed `closed` and no pending, active,
+partial or closing record remains. Executor exits immediately after its final
+summary; signal checks Mongo every10 seconds and sends one short stopped alert.
+Same-day restarts detect completion before broker login/chart fetch. Signal's
+`user_name` must match executor's trade-collection user for this shutdown check.
+No new completion document/field is needed. Yesterday's closed record does not
+stop today's jobs. No-trade/aborted/skip days keep existing scheduled shutdown;
+unresolved orders never count as a completed trade. Normal closing-bell alerts
+are sent only when the jobs reach scheduled shutdown, not again after a trade.
 
 Stale/missing signals block entry and ordinary channel exits and alert explicitly.
 **15:15 closure does not depend on the signal job**; if a quote/API fails the

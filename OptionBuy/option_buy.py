@@ -264,24 +264,25 @@ def status_message(strategies, now):
     if trade is None:
         return "FLAT | no trade today"
     state = trade["strategy_state"]
-    text = f"{state.upper()} | {trade['long_option_symbol']} x{trade['quantity']}"
+    text = f"{trade['long_option_symbol']} | Qty {trade['quantity']}"
     if state == "pending":
         return text + " | reconciling entry"
     if state == "aborted":
         return text + " | " + trade["exit_reason"] + " | daily slot consumed"
     if state not in ("active", "closed") or "running_net_pnl" not in trade:
         return text + " | P&L monitoring unavailable; reconcile legacy/accounting state"
-    text += (f" | net {'realized' if state == 'closed' else 'if closed now (estimated)'} "
-             f"Rs{trade['running_net_pnl']:.2f} | gross Rs{trade['running_pnl']:.2f}"
-             f" | observed net max/min Rs{trade['max_net_pnl_reached']:.2f}"
-             f"/{trade['min_net_pnl_reached']:.2f}"
-             f" | observed gross max/min Rs{trade['max_pnl_reached']:.2f}"
-             f"/{trade['min_pnl_reached']:.2f}"
-             f" | entry {trade['entry_time']} @ {trade['long_option_cost']:.2f}"
-             f" | mark {trade['last_mark']}")
     if state == "closed":
-        text += (f" | exit {trade['exit_time']} @ {trade['long_exit_price']:.2f}"
-                 f" | charges Rs{trade['charges']['total']:.2f} | {trade['exit_reason']}")
+        text += (f"\nEntry {trade['entry_time']} @ {trade['long_option_cost']:.2f}"
+                 f" -> Exit {trade['exit_time']} @ {trade['long_exit_price']:.2f}"
+                 f"\nNet Rs{trade['net_pnl']:.2f} | P&L Rs{trade['pnl']:.2f}"
+                 f" | Charges Rs{trade['charges']['total']:.2f}"
+                 f"\nNet max/min Rs{trade['max_net_pnl_reached']:.2f}"
+                 f" / Rs{trade['min_net_pnl_reached']:.2f} | {trade['exit_reason']}")
+    else:
+        text += (f"\nEntry {trade['entry_time']} @ {trade['long_option_cost']:.2f}"
+                 f" | Net est. Rs{trade['running_net_pnl']:.2f}"
+                 f"\nNet max/min Rs{trade['max_net_pnl_reached']:.2f}"
+                 f" / Rs{trade['min_net_pnl_reached']:.2f} | As of {trade['last_mark'][11:19]}")
     return text
 
 
@@ -376,11 +377,15 @@ def main():
     latest_state = "Waiting for first pass"
     try:
         mode = "paper" if config["simulated"] else "live"
-        notify(slack, f"Nifty premium executor started: {VERSION};1%20/20; {mode}; quantity {quantity}")
-        notify(slack, f"Nifty premium executor public IP: {util.get_public_ip()}")
+        notify(slack, f"Nifty executor started | {mode} | Qty {quantity} | IP {util.get_public_ip()}")
         while True:
             now = now_ist()
             try:
+                if (strategies.count_documents({"strategy_state": {"$in": ACTIVE_STATES}}) == 0
+                        and strategies.find_one({"entry_date": str(now.date()),
+                                                 "strategy_state": "closed"}) is not None):
+                    notify(slack, "Trade complete. Executor stopped.\n" + status_message(strategies, now))
+                    return
                 if now.strftime("%H:%M") >= "15:16" and strategies.count_documents(
                         {"strategy_state": {"$in": ACTIVE_STATES}}) == 0:
                     break
@@ -389,12 +394,10 @@ def main():
                     message = step(conn, strategies, orders, signals, config["user"], quantity,
                                    now_ist(), config["simulated"])
                     latest_state = status_message(strategies, now_ist())
-                    signal = signals.find_one({"_id": SIGNAL_ID})
-                    if signal is not None:
-                        latest_state += f" | signal updated {signal['updated_at']}"
-                        if signal.get("skip_day"):
-                            latest_state += " | dual breakout: skip today"
                     if message:
+                        if message.startswith("Position closed | "):
+                            notify(slack, "Trade complete. Executor stopped.\n" + latest_state)
+                            return
                         notify(slack, message)
                 if last_error is not None:
                     notify(slack, "Nifty premium executor recovered")
@@ -408,8 +411,8 @@ def main():
             if now - heartbeat >= timedelta(hours=1):
                 state = latest_state
                 if last_error is not None:
-                    state = "ERROR: " + last_error + " | last good state: " + latest_state
-                notify(slack, "Nifty premium executor alive | " + state)
+                    state = "ERROR: " + last_error
+                notify(slack, "Nifty status\n" + state)
                 heartbeat = now
             time.sleep(10)
         notify(slack, "Nifty premium executor closing bell | " + status_message(strategies, now_ist()))

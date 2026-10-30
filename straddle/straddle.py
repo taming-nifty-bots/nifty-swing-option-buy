@@ -177,6 +177,7 @@ def main():
     slack = WebClient(token=config["slack"])
     client = MongoClient(config["mongo"])
     collection = client["Bots"]["supertrend"]
+    strategies = client["Bots"][f"nifty_swing_{config['user']}"]
     master = None
     master_day = None
     last_minute = None
@@ -186,11 +187,16 @@ def main():
     latest_state = "Waiting for completed09:30 candles"
     published_day = None
     try:
-        notify(slack, f"Nifty premium Renko signal started: {VERSION};1%20/20; no orders")
-        notify(slack, f"Nifty premium signal public IP: {util.get_public_ip()}")
+        notify(slack, f"Nifty signal started | 1% 20/20 | IP {util.get_public_ip()}")
         while True:
             now = now_ist()
             try:
+                if (strategies.count_documents(
+                        {"strategy_state": {"$in": ["pending", "active", "partial", "closing"]}}) == 0
+                        and strategies.find_one({"entry_date": str(now.date()),
+                                                 "strategy_state": "closed"}) is not None):
+                    notify(slack, "Trade complete. Signal job stopped.")
+                    return
                 if now.strftime("%H:%M") >= "15:16":
                     break
                 minute = now.replace(second=0, microsecond=0)
@@ -200,15 +206,16 @@ def main():
                         master = dhan.load_instruments()
                         master_day = now.date()
                     doc = publish(conn, collection, master, config["user"], now)
-                    latest_state = f"ATM {doc['STRIKE']} | expiry {doc['expiry']} | updated {doc['updated_at']}"
+                    latest_state = f"ATM {doc['STRIKE']} | Expiry {doc['expiry']} | Updated {doc['updated_at'][11:19]}"
+                    details = latest_state
                     for kind in ("CE", "PE"):
-                        latest_state += (f" | {kind} close={doc[kind + '_close']} "
+                        details += (f" | {kind} close={doc[kind + '_close']} "
                                          f"high20={doc[kind + '_last_20_high']} "
                                          f"low20={doc[kind + '_last_20_low']} "
                                          f"asof={doc[kind + '_data_asof']}")
-                    print(latest_state, flush=True)
+                    print(details, flush=True)
                     if published_day != now.date():
-                        notify(slack, "Nifty premium charts ready | " + latest_state)
+                        notify(slack, "Nifty charts ready | " + latest_state)
                         published_day = now.date()
                     last_minute = minute
                 if last_error is not None:
@@ -223,8 +230,8 @@ def main():
             if now - heartbeat >= timedelta(hours=1):
                 state = latest_state
                 if last_error is not None:
-                    state = "ERROR: " + last_error + " | last good state: " + latest_state
-                notify(slack, "Nifty premium signal alive | " + state)
+                    state = "ERROR: " + last_error
+                notify(slack, "Nifty signal status | " + state)
                 heartbeat = now
             time.sleep(10)
         notify(slack, "Nifty premium signal closing bell | " + latest_state)
