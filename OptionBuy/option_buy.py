@@ -344,6 +344,11 @@ def step(conn, strategies, orders, signals, user, quantity, now, simulated=True)
     if strategies.find_one({"entry_date": str(now.date())}) is not None:
         return None
     doc = signals.find_one({"_id": SIGNAL_ID})
+    if (now.strftime("%H:%M") == "09:31"
+            and (doc is None or (
+                doc.get("_id") == SIGNAL_ID and doc.get("strategy_version") == VERSION
+                and pd.Timestamp(doc["updated_at"]).date() < now.date()))):
+        return "Waiting for today's signal"
     doc = fresh_signal(doc, user, now)
     if doc.get("skip_day"):
         return None
@@ -389,12 +394,18 @@ def main():
                 if now.strftime("%H:%M") >= "15:16" and strategies.count_documents(
                         {"strategy_state": {"$in": ACTIVE_STATES}}) == 0:
                     break
-                if now.strftime("%H:%M") >= "09:15":
+                if (now.strftime("%H:%M") >= "09:31" or strategies.count_documents(
+                        {"strategy_state": {"$in": ACTIVE_STATES}}) > 0):
                     conn = dhan.login_to_dhan(slack_channel="niftyswing")
                     message = step(conn, strategies, orders, signals, config["user"], quantity,
                                    now_ist(), config["simulated"])
-                    latest_state = status_message(strategies, now_ist())
-                    if message:
+                    if message == "Waiting for today's signal":
+                        if latest_state != message:
+                            print(message, flush=True)
+                        latest_state = message
+                    else:
+                        latest_state = status_message(strategies, now_ist())
+                    if message and message != "Waiting for today's signal":
                         if message.startswith("Position closed | "):
                             notify(slack, "Trade complete. Executor stopped.\n" + latest_state)
                             return

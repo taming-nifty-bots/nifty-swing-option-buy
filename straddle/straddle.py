@@ -42,12 +42,12 @@ def notify(client, message):
 def locked_contracts(master, index, day):
     frame = index.copy()
     frame["datetime"] = pd.to_datetime(frame["datetime"])
-    spot = frame.loc[frame["datetime"] == pd.Timestamp(day + " 09:30")]
+    spot = frame.loc[frame["datetime"] == pd.Timestamp(day + " 09:29")]
     if len(spot) != 1:
-        raise ValueError("Need the exact Nifty 09:30 minute open to lock ATM")
-    price = float(spot.iloc[0]["open"])
+        raise ValueError("Need the exact completed Nifty 09:29 minute close to lock ATM")
+    price = float(spot.iloc[0]["close"])
     if not math.isfinite(price) or price <= 0:
-        raise ValueError("Invalid Nifty 09:30 price")
+        raise ValueError("Invalid Nifty 09:29 close")
     strike = int(util.round_to_nearest(price, base=50))
     options = master.loc[(master["UNDERLYING_SYMBOL"] == "NIFTY")
                          & (master["INSTRUMENT"] == "OPTIDX")
@@ -68,7 +68,7 @@ def locked_contracts(master, index, day):
                                symbol=str(row["DISPLAY_NAME"]), lot_size=int(row["LOT_SIZE"]))
     if contracts["CE"]["lot_size"] != contracts["PE"]["lot_size"]:
         raise ValueError("CE/PE lot sizes disagree")
-    return dict(strike=strike, spot_0930_open=price, expiry=str(expiry.date()),
+    return dict(strike=strike, spot_0929_close=price, expiry=str(expiry.date()),
                 dte=(expiry.date() - pd.Timestamp(day).date()).days, contracts=contracts)
 
 
@@ -122,6 +122,8 @@ def option_levels(candles, day, now):
 
 
 def publish(conn, collection, master, user, now):
+    if now.strftime("%H:%M") < "09:30":
+        raise ValueError("Wait until09:30 for the completed09:29 reference candle")
     day = str(now.date())
     key = SIGNAL_ID
     doc = collection.find_one({"_id": key})
@@ -132,7 +134,7 @@ def publish(conn, collection, master, user, now):
         index = dhan.fetch_candles(conn, 13, "IDX_I", "INDEX",
                                    now.replace(hour=0, minute=0, second=0, microsecond=0), now)
         locked = locked_contracts(master, index, day)
-        values = dict(strategy_version=VERSION, ATM=locked["spot_0930_open"],
+        values = dict(strategy_version=VERSION, ATM=locked["spot_0929_close"],
                       STRIKE=locked["strike"], expiry=locked["expiry"], dte=locked["dte"])
         for kind in ("CE", "PE"):
             contract = locked["contracts"][kind]
@@ -184,7 +186,7 @@ def main():
     last_error = None
     last_alert = now_ist()
     heartbeat = now_ist()
-    latest_state = "Waiting for completed09:30 candles"
+    latest_state = "Waiting for completed09:29 candles"
     published_day = None
     try:
         notify(slack, f"Nifty signal started | 1% 20/20 | IP {util.get_public_ip()}")
@@ -200,7 +202,7 @@ def main():
                 if now.strftime("%H:%M") >= "15:16":
                     break
                 minute = now.replace(second=0, microsecond=0)
-                if now.weekday() < 5 and now.strftime("%H:%M") >= "09:31" and minute != last_minute:
+                if now.weekday() < 5 and now.strftime("%H:%M") >= "09:30" and minute != last_minute:
                     conn = dhan.login_to_dhan(slack_channel="niftyswing")
                     if master_day != now.date():
                         master = dhan.load_instruments()

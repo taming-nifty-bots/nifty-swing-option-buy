@@ -6,9 +6,9 @@ strategy. Version: `premium-renko-levels-1pct-20-20-2026-10-29`.
 
 ## Frozen rules
 
-- Lock ATM from Nifty's **09:30 minute open**, rounded to the nearest50 strike.
-  Initialization waits for that minute to complete; a restart uses the same
-  observation, never the current spot.
+- At **09:30**, lock ATM from Nifty's completed **09:29 minute close**, rounded
+  to the nearest50 strike. A restart uses that exact observation, never current
+  spot. Same-day locks already published before this change are preserved.
 - Select the nearest listed expiry **strictly more than6 calendar days away**,
   at that strike for both CE and PE. Freeze both contracts for the day.
 - Use **available exact-contract candles from14 calendar days** of history,
@@ -31,7 +31,7 @@ strategy. Version: `premium-renko-levels-1pct-20-20-2026-10-29`.
 
 | Existing path/job | New responsibility |
 |---|---|
-| `straddle/straddle.py` / signal job | Lock09:30 ATM/expiry, form CE/PE charts, update `close`, `high20`, `low20` in Mongo |
+| `straddle/straddle.py` / signal job | From09:30, lock ATM from09:29 close/expiry, form CE/PE charts, update `close`, `high20`, `low20` in Mongo |
 | `OptionBuy/option_buy.py` / execution job | Read Mongo levels, decide breakouts/entries/exits, manage one trade and net P&L |
 
 All strategy code lives in these **two existing scripts**, with no added shared
@@ -46,7 +46,7 @@ configure it correctly on Option Buy.
 | Flat field | Meaning |
 |---|---|
 | `updated_at`, `strategy_version`, `broker` | Publication timestamp (also identifies session date) and identity |
-| `ATM`, `STRIKE`, `expiry`, `dte` |09:30 Nifty spot open, rounded ATM strike and selected expiry |
+| `ATM`, `STRIKE`, `expiry`, `dte` |09:29 Nifty close, rounded ATM strike and selected expiry (existing same-day locks retained) |
 | `CE_symbol`, `PE_symbol` | Exact dated option symbols |
 | `CE_security_id`, `PE_security_id` | Dhan security IDs |
 | `CE_lot_size`, `PE_lot_size` | Contract lot sizes |
@@ -63,11 +63,22 @@ stored first decision. Levels persist without new bricks; channels remain
 fields. Entry needs a post09:30 brick and fresh completed source data, but the
 brick itself may be older than the latest source minute.
 
-On a new day, publisher re-locks09:30 ATM/expiry and replaces all session fields
+On a new day, publisher starts at09:30, locks ATM from09:29 close/expiry and replaces all session fields
 on the same document only after both charts succeed. Until then yesterday's
 `updated_at` date/freshness blocks execution. No separate `day` field is stored.
 Same-day restarts retain the contract lock. Old daily-ID
 documents are left untouched; no automatic deletion or production migration.
+
+The idle executor starts broker/entry checks at09:31; existing positions still
+recover before then. Bricks before09:30 never qualify for entry, so09:30
+publication primes the charts, and the first eligible entry remains09:31.
+During the09:31 minute only, no document or a previous-day document is a
+console-logged waiting state, not Slack error/recovery spam. At09:32 those
+conditions raise the existing error. Malformed, incompatible, future-dated or
+stale-today publications still raise, and active positions never use this grace.
+Jobs must be scheduled to run by their respective gates; cloud schedules and
+workflow are not changed here. Prior eight-session research used09:30 open,
+not the new09:29 close; its results do not validate this changed reference.
 
 The daily trade ID is deterministic and atomically inserted. Paper BUY/SELL order
 IDs are deterministic too, so a saved fill is reused if a process crashes before
