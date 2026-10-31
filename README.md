@@ -27,6 +27,34 @@ strategy. Version: `premium-renko-levels-1pct-20-20-2026-10-29`.
   strictly before15:15. After restart, evaluate the latest fresh levels, even if
   an earlier breakout was missed. No historical breakout/exit replay.
 
+## Signal flow simplified October31
+
+The signal job now reads directly in `main()`: wait for09:30, load the saved
+daily lock (or select ATM/CE/PE/expiry from09:29 close), calculate both Renko
+charts, then update Mongo together. Removed the `settings`, `now_ist` and
+`publish` wrappers; startup configuration, IST time and publication are inline.
+Five functions remain: `main`, `notify`, `locked_contracts`, `session_candles`
+and `option_levels`. The last three keep contract selection, candle safety and
+Renko calculations separate from the job loop; their ASTs are unchanged.
+
+Same-day restart locks, the executor-owned skip marker, atomic publication,
+freshness/low-premium guards, monitoring and shutdown behavior are preserved.
+The version, flat Mongo schema, >6-DTE expiry rule and executor are unchanged.
+This is a readability change, not a new trading configuration or deployment.
+
+Offline checks in the existing sibling research repository:
+
+```powershell
+python ..\nifty-spreads-backtest\tests\test_current_option_strategy.py
+python -m compileall -q OptionBuy straddle
+```
+
+Eighteen focused replay/signal checks pass, including five new mocked job-flow
+tests for the09:30 gate, once-per-minute publication, exact flat fields,
+executor compatibility, restart locks, failed-fetch retries, rollover, unsafe
+data and concurrent writes. Twenty-nine checks pass with the related history
+and downloader tests. No live broker/Mongo calls or orders were made.
+
 ## Preserved jobs and storage
 
 | Existing path/job | New responsibility |

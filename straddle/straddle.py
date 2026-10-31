@@ -16,21 +16,6 @@ VERSION = "premium-renko-levels-1pct-20-20-2026-10-29"
 SIGNAL_ID = "nifty_options_renko"
 
 
-def now_ist():
-    return datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-
-
-def settings():
-    for key in ("CONNECTION_STRING", "user_name", "slack_token", "DHAN_CLIENT_ID",
-                "DHAN_PIN", "DHAN_TOTP"):
-        if not os.environ.get(key, "").strip():
-            raise ValueError("Missing environment variable: " + key)
-    if os.environ.get("instrument_name", "NIFTY") != "NIFTY":
-        raise ValueError("This strategy supports NIFTY only")
-    return dict(user=os.environ["user_name"], mongo=os.environ["CONNECTION_STRING"],
-                slack=os.environ["slack_token"])
-
-
 def notify(client, message):
     print(message, flush=True)
     try:
@@ -121,77 +106,30 @@ def option_levels(candles, day, now):
                 data_asof=str(data_asof))
 
 
-def publish(conn, collection, master, user, now):
-    if now.strftime("%H:%M") < "09:30":
-        raise ValueError("Wait until09:30 for the completed09:29 reference candle")
-    day = str(now.date())
-    key = SIGNAL_ID
-    doc = collection.find_one({"_id": key})
-    new_day = doc is None or pd.Timestamp(doc["updated_at"]).date() != now.date()
-    if doc is not None and pd.Timestamp(doc["updated_at"]) > pd.Timestamp(now):
-        raise ValueError("Cannot overwrite a newer signal day")
-    if new_day:
-        index = dhan.fetch_candles(conn, 13, "IDX_I", "INDEX",
-                                   now.replace(hour=0, minute=0, second=0, microsecond=0), now)
-        locked = locked_contracts(master, index, day)
-        values = dict(strategy_version=VERSION, ATM=locked["spot_0929_close"],
-                      STRIKE=locked["strike"], expiry=locked["expiry"], dte=locked["dte"])
-        for kind in ("CE", "PE"):
-            contract = locked["contracts"][kind]
-            values[kind + "_symbol"] = contract["symbol"]
-            values[kind + "_security_id"] = contract["security_id"]
-            values[kind + "_lot_size"] = contract["lot_size"]
-    else:
-        values = dict(doc)
-        values.pop("_id")
-        values.pop("day", None)
-        values.pop("CE_last_40_high", None)
-        values.pop("PE_last_40_high", None)
-    if values["strategy_version"] != VERSION:
-        raise ValueError("Incompatible daily signal; do not overwrite its contract lock")
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
-    for kind in ("CE", "PE"):
-        security = values[kind + "_security_id"]
-        bars = dhan.fetch_candles(conn, security, "NSE_FNO", "OPTIDX", start, now)
-        for field, value in option_levels(bars, day, now).items():
-            values[kind + "_" + field] = value
-    values.update(updated_at=str(now), broker="DHAN")
-    # Publish both contracts together; failed history fetches leave the old day stale.
-    query = {"_id": key}
-    if doc is not None:
-        query["updated_at"] = doc["updated_at"]
-    changes = {"$set": values, "$unset": {
-        "day": "", "CE_last_40_high": "", "PE_last_40_high": ""}}
-    if new_day:
-        changes["$unset"]["skip_day"] = ""
-    else:
-        # This marker belongs to the executor; do not copy an older value over it.
-        values.pop("skip_day", None)
-    result = collection.update_one(query, changes, upsert=doc is None)
-    if doc is not None and result.matched_count != 1:
-        raise ValueError("Signal day changed during publication; retry with the current lock")
-    return collection.find_one({"_id": key})
-
-
 def main():
     load_dotenv(find_dotenv())
-    config = settings()
-    slack = WebClient(token=config["slack"])
-    client = MongoClient(config["mongo"])
+    for key in ("CONNECTION_STRING", "user_name", "slack_token", "DHAN_CLIENT_ID",
+                "DHAN_PIN", "DHAN_TOTP"):
+        if not os.environ.get(key, "").strip():
+            raise ValueError("Missing environment variable: " + key)
+    if os.environ.get("instrument_name", "NIFTY") != "NIFTY":
+        raise ValueError("This strategy supports NIFTY only")
+    slack = WebClient(token=os.environ["slack_token"])
+    client = MongoClient(os.environ["CONNECTION_STRING"])
     collection = client["Bots"]["supertrend"]
-    strategies = client["Bots"][f"nifty_swing_{config['user']}"]
+    strategies = client["Bots"][f"nifty_swing_{os.environ['user_name']}"]
     master = None
     master_day = None
     last_minute = None
     last_error = None
-    last_alert = now_ist()
-    heartbeat = now_ist()
+    heartbeat = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+    last_alert = heartbeat
     latest_state = "Waiting for completed09:29 candles"
     published_day = None
     try:
         notify(slack, f"Nifty signal started | 1% 20/20 | IP {util.get_public_ip()}")
         while True:
-            now = now_ist()
+            now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
             try:
                 if (strategies.count_documents(
                         {"strategy_state": {"$in": ["pending", "active", "partial", "closing"]}}) == 0
@@ -207,7 +145,49 @@ def main():
                     if master_day != now.date():
                         master = dhan.load_instruments()
                         master_day = now.date()
-                    doc = publish(conn, collection, master, config["user"], now)
+                    day = str(now.date())
+                    doc = collection.find_one({"_id": SIGNAL_ID})
+                    new_day = doc is None or pd.Timestamp(doc["updated_at"]).date() != now.date()
+                    if doc is not None and pd.Timestamp(doc["updated_at"]) > pd.Timestamp(now):
+                        raise ValueError("Cannot overwrite a newer signal day")
+                    if new_day:
+                        index = dhan.fetch_candles(
+                            conn, 13, "IDX_I", "INDEX",
+                            now.replace(hour=0, minute=0, second=0, microsecond=0), now)
+                        locked = locked_contracts(master, index, day)
+                        values = dict(strategy_version=VERSION, ATM=locked["spot_0929_close"],
+                                      STRIKE=locked["strike"], expiry=locked["expiry"], dte=locked["dte"])
+                        for kind in ("CE", "PE"):
+                            contract = locked["contracts"][kind]
+                            values[kind + "_symbol"] = contract["symbol"]
+                            values[kind + "_security_id"] = contract["security_id"]
+                            values[kind + "_lot_size"] = contract["lot_size"]
+                    else:
+                        values = dict(doc)
+                        values.pop("_id")
+                    if values["strategy_version"] != VERSION:
+                        raise ValueError("Incompatible daily signal; do not overwrite its contract lock")
+                    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
+                    for kind in ("CE", "PE"):
+                        bars = dhan.fetch_candles(
+                            conn, values[kind + "_security_id"], "NSE_FNO", "OPTIDX", start, now)
+                        for field, value in option_levels(bars, day, now).items():
+                            values[kind + "_" + field] = value
+                    values.update(updated_at=str(now), broker="DHAN")
+                    for field in ("day", "CE_last_40_high", "PE_last_40_high", "skip_day"):
+                        values.pop(field, None)
+                    query = {"_id": SIGNAL_ID}
+                    if doc is not None:
+                        query["updated_at"] = doc["updated_at"]
+                    changes = {"$set": values, "$unset": {
+                        "day": "", "CE_last_40_high": "", "PE_last_40_high": ""}}
+                    if new_day:
+                        changes["$unset"]["skip_day"] = ""
+                    # Both charts must succeed; preserve the executor-owned same-day skip marker.
+                    result = collection.update_one(query, changes, upsert=doc is None)
+                    if doc is not None and result.matched_count != 1:
+                        raise ValueError("Signal day changed during publication; retry with the current lock")
+                    doc = collection.find_one({"_id": SIGNAL_ID})
                     latest_state = f"ATM {doc['STRIKE']} | Expiry {doc['expiry']} | Updated {doc['updated_at'][11:19]}"
                     details = latest_state
                     for kind in ("CE", "PE"):
